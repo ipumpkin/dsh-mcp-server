@@ -99,6 +99,7 @@ agent 循环一旦卡死，任务会无限阻塞 MCP 客户端。有两道保护
 | `agent_run` / `task_inbox` 传 `newSession: true` | 本次强制全新会话；旧池会话退役（dispose）但持久化保留，仍可凭其 sessionId 续接 |
 | `agent_run` / `task_inbox` 传 `model` / `provider` | 按次模型覆盖（对新建/resume 会话生效；池复用的会话保持原模型） |
 | `agent_run` / `task_inbox` 传 `mode` / `preset` / `sandbox` / `approval` | 按指定模式创建会话：`preset` 挂载 agent 预设（standard/code/cordis/minimal 等，记入 session header 的 agentPreset）；`mode` 接受 `mode_list.modes` 的任一 id——权限预设名（捆绑，如 workspace-write = workspace-write + ask）、沙箱模式、审批策略或 preset id；`sandbox`/`approval` 显式覆盖捆绑值。指定任一即**强制全新会话**（池会话无法安全套用新模式），沙箱/审批以持久会话日志事件（`sandbox/mode` / `approval/policy`）落盘，会话自第一轮起就跑在该模式下、避免任务中途再提权；结果与 `session_list` 带 mode 快照验证生效。续接存量 `sessionId` 时 `sandbox`/`approval` 会被拒绝（需新建）；`preset` 单独允许（resume 的 setup 里挂载） |
+| 新会话传 `title`（可选） | 给新会话命名（走 sessionTitle 服务 rename）；**未传时自动按任务内容派生可读名称**（首句截断 ≤60 字符，同一 rename 路径）——新会话开箱即有名字，结果带 `title` 字段，`session_list` 可见；复用会话不改名 |
 | *(都不传)* | 缺省：复用该 cwd 的常驻池会话 |
 | `session_list` | 盘点池 / live / 持久化三层会话（id、cwd、来源、标题、上下文占用），决定续接哪个 |
 | `session_read` | 续接前先读该会话的转录（文本/工具调用/结果），确认它做过什么 |
@@ -129,6 +130,8 @@ agent 循环一旦卡死，任务会无限阻塞 MCP 客户端。有两道保护
 ### 审批/提问接管与 web UI 提示（notice）
 
 MCP 拦截审批/提问后，web 会话界面会收到两条折叠提示行（`form:'notice'` 的 `user/message`：接管中 + 已响应）。**通知采用安全落点机制**：拦截（`approval/request` / 提问 provider）时只把提示入队、绝不直接写会话日志；待该工具执行完成，由 `tools/post-execute` 监听器把提示并入工具结果的 `additionalContexts`，交给 agent-loop 在 `tool/result` 之后、下个模型请求之前追加（与 `dsh-repeat-tool-reminder` / `dsh-tool-goal` 官方插件同款机制）。
+
+- 提示行走 **DSH 原生 notice 专属呈现**：`source.form:'notice'` + `summary` 在 `additionalContexts` 路径上原样保留（web 前端 `contextForm` 的 `KNOWN_FORMS` 含 `notice`，折叠行直接展示摘要、展开为正文），与官方插件完全同款；文案按系统/状态提示撰写（`⏳` 接管中 / `✅` 已响应 / `❌` 失败，明确「审批/提问已由 MCP 接管/响应」措辞）。折叠行标题「上下文注入」是 web UI 对所有上下文行的固定命名（插件侧不可改写），但 notice 的内容语义是 notice/系统提示而非底层调用。
 
 - 这保证 notice **从不会插进 assistant 带 `tool_calls` 的消息与其 `tool/result` 之间**——旧版（0.9.4 起）直接在拦截期 append `user/message`，若时机落在两者之间会打断模型消息序列，使下个模型请求报 `An assistant message with tool_calls must be followed by tool messages responding to each tool_call_id`（INVALID_REQUEST），会话失效。
 - **已损坏的会话**（旧版代码曾把 notice 写进中间位置）：无法就地修复，直接**重新开会话**即可——`agent_run` 不带 `sessionId` 会开/复用新会话，或传 `newSession: true` 强制全新会话；旧会话可忽略或 `session_close` 退役，不影响其他会话。本插件不重写历史日志。

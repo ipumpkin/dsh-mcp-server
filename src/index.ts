@@ -84,7 +84,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.9.7"
+export const VERSION = "0.9.8"
 
 /**
  * 声明依赖的核心服务。
@@ -157,6 +157,51 @@ function out(content: string) {
 /** 错误响应: 结构化 JSON 文本 + isError 标记(MCP 客户端可据此识别失败, 不写回记忆) */
 function err(content: string) {
   return { content: [{ type: 'text' as const, text: content }], isError: true as const }
+}
+
+/**
+ * 从任务内容派生一个可读的会话标题(新建会话未显式传 title 时使用, 走 sessionTitle 服务的 rename)。
+ * 背景: DSH 原生的自动命名只对 source.kind === 'user' 的消息触发(collectSessionTitleMessages 过滤),
+ * 而本插件投喂的全是 plugin 来源消息, 所以 MCP 新建会话永远得不到名字, session_list 里一串空名。
+ * 这里与 dsh-session-title 的 deterministic fallback 同思路: 清控制字符/转义、归一空白、
+ * 取首句(句读/换行截断), 超长截断 —— 保证每个新会话开箱即有可读名称。
+ */
+function deriveSessionTitle(text: string, maxChars = 60): string {
+  const cleaned = String(text ?? '')
+    .replace(/[\u001B\u009B]/g, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned) return ''
+  const firstSentence = cleaned.split(/[。！？!?\n]/, 1)[0] ?? cleaned
+  const sentence = firstSentence.trim()
+  if (sentence.length <= maxChars) return sentence
+  return `${sentence.slice(0, maxChars - 1)}…`
+}
+
+/** sessionTitle 服务的只读视图(可选依赖; 未加载时返回 undefined) */
+interface SessionTitleView {
+  get?: (s: unknown) => { title?: string } | undefined
+  rename?: (s: unknown, t: string) => unknown
+}
+
+/** 读会话当前标题快照(sessionTitle 服务; 缺失/尚无标题返回 undefined) */
+function sessionTitleOf(ctx: Context, session: unknown): string | undefined {
+  const st = ctx.get('sessionTitle') as SessionTitleView | undefined
+  return st?.get?.(session)?.title
+}
+
+/** 给会话命名(sessionTitle 服务 rename; 失败仅告警, 不阻断任务)。返回实际生效的标题(可能 undefined) */
+function renameSessionSafe(ctx: Context, session: unknown, title: string): string | undefined {
+  try {
+    const st = ctx.get('sessionTitle') as SessionTitleView | undefined
+    if (!st?.rename) return undefined
+    const snapshot = st.rename(session, title) as { title?: string } | undefined
+    return snapshot?.title ?? title
+  } catch (e) {
+    console.warn('[harness-mcp-server] session title set failed:', String(e))
+    return undefined
+  }
 }
 
 /** 工作区视图(ctx.get('workspaceRegistry')): 可选依赖, headless/无 workspace 插件的环境自动跳过 */
@@ -399,15 +444,10 @@ async function createPoolAgent(ctx: Context, cwd: string, title?: string, agentO
     }
   })()
 
-  // title 命名(可选): 创建会话后立即命名(走 sessionTitle 服务的 rename)
+  // title 命名(可选): 创建会话后立即命名(走 sessionTitle 服务的 rename; 显式 title 或
+  // 由任务内容自动派生的名称都走同一条路径, 使新会话开箱即有名字, session_list 可见)
   if (title) {
-    try {
-      const session = handle.agent.session as { id?: unknown }
-      const st = ctx.get('sessionTitle') as { rename?: (s: unknown, t: string) => unknown } | undefined
-      st?.rename?.(session, title)
-    } catch (e) {
-      console.warn('[harness-mcp-server] session title set failed:', String(e))
-    }
+    renameSessionSafe(ctx, handle.agent.session, title)
   }
 
   return rec
@@ -425,6 +465,8 @@ async function withLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
 interface TaskResult {
   taskId: string
   sessionId: string
+  /** 会话标题: 显式 title, 或新建会话时按任务内容自动生成的名字(sessionTitle 服务缺失时缺省) */
+  title?: string
   assistantText: string
   toolCalls: { name: string; args: string }[]
   toolResults: string[]
@@ -949,7 +991,19 @@ function agentIdOf(agent: unknown): string | undefined {
   return id === undefined ? undefined : String(id)
 }
 
-/** 构造一条 form:'notice' 的 plugin 来源 user/message(web UI 折叠提示行专属呈现, 与官方插件同款) */
+/**
+ * 构造一条 form:'notice' 的 plugin 来源 user/message(web UI 折叠提示行专属呈现, 与官方插件同款)。
+ *
+ * 呈现契约(已对照 DSH web 前端 0.1.1-rc.2 源码 + 实际运行 GUI 的 client 包确认):
+ *  - dsh-agent-loop 把 additionalContexts 里的消息原样 append 为 user/message(source 含 form/summary),
+ *    即 form:'notice' 在 additionalContexts 路径上**会被保留**——因此无需 exec.deferContext 等替代方案;
+ *  - dsh-client-runtime 的 contextForm(source) 读 source.form, KNOWN_FORMS 含 'notice'
+ *    (dsh-client-ui-conversation 的 contextBody 也实现 case 'notice' → NoticeBody + 折叠行 summary),
+ *    所以 notice 走的是 DSH 原生 notice 专属呈现, 与 dsh-repeat-tool-reminder / dsh-tool-goal 完全同款;
+ *  - 折叠行标题「上下文注入」(message.contextInjection) 是 UI 对所有非 recall 上下文行的固定命名,
+ *    插件侧无法改写; 因此这里的文案按「系统/状态提示」撰写(带 ⏳/✅ 与明确的
+ *    「审批/提问已由 MCP 接管/响应」措辞), 让折叠行与展开体读起来是 notice/系统提示而非底层调用。
+ */
 function noticeUserMessage(text: string, summary: string) {
   return createUserMessage({
     content: [{ type: 'text', text }],
@@ -1029,8 +1083,10 @@ async function executeTask(
     if (opts?.shouldAbort?.()) throw new Error('task cancelled')
     // 指定模式且未传 sessionId 时恒强制全新会话(池复用的存量会话无法安全套用新模式)
     const modeRequested = opts?.mode !== undefined && (opts.mode.preset !== undefined || opts.mode.sandbox !== undefined || opts.mode.approval !== undefined)
+    // 会话命名: 显式 title 优先; 未传时按任务内容派生可读名称(只在新建会话时经 rename 落为 session/title 事件)
+    const effectiveTitle = title ?? deriveSessionTitle(task || context)
     const { sessionId, handle, disposeAfter } = await getAgent(
-      ctx, workdir, resumeSessionId, title, opts?.fresh || (modeRequested && resumeSessionId === undefined),
+      ctx, workdir, resumeSessionId, effectiveTitle, opts?.fresh || (modeRequested && resumeSessionId === undefined),
       { provider: opts?.provider, model: opts?.model }, opts?.mode,
     )
     const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
@@ -1047,6 +1103,13 @@ async function executeTask(
     const result: TaskResult = {
       taskId: '', sessionId, assistantText: '', toolCalls: [], toolResults: [],
       changes: '', verification: '', leftovers: '',
+    }
+    // 会话标题带回结果: 以 sessionTitle 服务快照为准(新建会话已由 rename 落事件; 复用会话读既有标题)
+    try {
+      const currentTitle = sessionTitleOf(ctx, handle.agent.session)
+      if (currentTitle !== undefined) result.title = currentTitle
+    } catch {
+      /* 标题读取失败不阻断结果返回 */
     }
 
     // 驱动 agent 执行; 执行/调度层抛出的异常(非超时)转成结构化 error 结果, 不再上抛导致空跑
@@ -1981,18 +2044,19 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         context: ContextUsage | null
         mode?: { preset: string; sandbox: string; approval: string; permissionPreset?: string } | null
       }>()
-      // 常驻池(本插件持有, 优先级最高; 上下文可直接测量)
+      const titleSvc = ctx.get('sessionTitle') as SessionTitleView | undefined
+      // 常驻池(本插件持有, 优先级最高; 上下文可直接测量; 标题直接从服务快照读, 不依赖 live 列表兜底)
       for (const [cwd, rec] of liveAgents) {
         const sid = String(rec.sessionId)
         const agent = rec.handle.agent
         rows.set(sid, {
           cwd, source: 'pool',
+          title: titleSvc?.get?.(agent.session)?.title,
           context: await contextUsage(ctx, agent.session, agent),
           mode: sessionModeOf(ctx, sid, agent.session, (agent.session as { header?: { agentPreset?: string } }).header),
         })
       }
       // live 会话(ctx.agents.list(); 可读标题)
-      const titleSvc = ctx.get('sessionTitle') as { get?: (s: unknown) => { title?: string } | undefined } | undefined
       const liveAgentsList = (ctx.agents as unknown as { list?: () => { session: { id: unknown; header?: { cwd?: string; agentPreset?: string } }; options?: { provider?: string; model?: string } }[] }).list?.() ?? []
       for (const agent of liveAgentsList) {
         const id = String(agent.session.id)
@@ -2350,7 +2414,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         req.signal?.removeEventListener('abort', onAbort)
         resolve(outcome)
         // 【2】web UI 提示(入队, 工具完成后安全落点): 弹窗已被 MCP 响应
-        queuePromptNotice(req.agent, `✅ 审批 ${promptId} 已由 MCP 侧响应: ${outcome}`, `MCP 响应审批: ${outcome}`)
+        // 文案按系统/状态提示撰写(带 ✅ 与明确「审批已由 MCP 响应」措辞), 见 noticeUserMessage 的呈现说明
+        queuePromptNotice(req.agent, `✅ 审批 ${promptId} 已由 MCP 侧响应: ${outcome}`, `✅ 审批已由 MCP 响应：${outcome}`)
       }
       const onAbort = () => settle('cancelled')
       pendingApprovals.set(promptId, { promptId, agentId, toolName: req.toolName, reason: req.reason, resolve: settle })
@@ -2358,8 +2423,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       // 【2】web UI 提示(入队, 工具完成后安全落点): 该审批已被 MCP 拦截接管
       queuePromptNotice(
         req.agent,
-        `⏳ 该审批（${req.toolName}${req.reason !== undefined ? `：${req.reason}` : ''}）已由 MCP 侧接管处理中，请在 Hermes/客户端响应（prompt ${promptId}）`,
-        `MCP 接管审批: ${req.toolName}`,
+        `⏳ 审批已由 MCP 接管（${req.toolName}${req.reason !== undefined ? `：${req.reason}` : ''}），等待 Hermes/客户端响应（prompt ${promptId}）`,
+        `⏳ 审批已由 MCP 接管：${req.toolName}`,
       )
     })
   }
@@ -2416,11 +2481,11 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
               })),
               resolve: (answer) => settle(() => {
                 // 【2】web UI 提示(入队, 工具完成后安全落点): 提问已由 MCP 响应
-                if (r.agent !== undefined) queuePromptNotice(r.agent, `✅ 提问 ${promptId} 已由 MCP 侧回答`, 'MCP 回答提问')
+                if (r.agent !== undefined) queuePromptNotice(r.agent, `✅ 提问 ${promptId} 已由 MCP 侧回答`, '✅ 提问已由 MCP 回答')
                 resolve(answer)
               }),
               reject: (e) => settle(() => {
-                if (r.agent !== undefined) queuePromptNotice(r.agent, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, 'MCP 取消提问')
+                if (r.agent !== undefined) queuePromptNotice(r.agent, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, '❌ 提问已取消/失败')
                 reject(e)
               }),
             })
@@ -2428,7 +2493,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
             // 【2】web UI 提示(入队, 工具完成后安全落点): 该提问已被 MCP 拦截接管
             if (r.agent !== undefined) {
               const first = r.questions[0]
-              queuePromptNotice(r.agent, `⏳ 该提问（${first?.question ?? '…'}）已由 MCP 侧接管处理中，请在 Hermes/客户端响应（prompt ${promptId}）`, 'MCP 接管提问')
+              queuePromptNotice(r.agent, `⏳ 提问已由 MCP 接管（${first?.question ?? '…'}），等待 Hermes/客户端响应（prompt ${promptId}）`, '⏳ 提问已由 MCP 接管')
             }
           })
         },

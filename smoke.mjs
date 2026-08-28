@@ -16,6 +16,10 @@
 //       agent_run/task_inbox 传 preset/mode/sandbox/approval 按模式创建会话(强制全新会话, meta.agentPreset
 //       记录 + 会话日志落 sandbox/mode、approval/policy 持久事件), 结果带 mode 快照验证生效;
 //       非法 mode 报错; sandbox/approval 不可续接存量会话, preset 单独允许 resume
+//   16. 会话自动命名: 新建会话未传 title 时按任务内容派生可读名称(走 sessionTitle 服务 rename,
+//       session/title 事件落日志), 结果带 title, session_list 池行可见; 显式 title 优先;
+//       sessionTitle 服务缺失时静默降级不崩溃。notice 原生呈现契约: form:'notice' + 折叠行
+//       summary 非空(web UI contextForm 识别 notice 的专属呈现), 文案为 ⏳/✅ 系统状态措辞。
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -131,6 +135,26 @@ const fakeSessions = {
   get: (id) => (id === 'sess-live' ? liveAgent.session : id === 'sess-live2' ? liveSession2 : undefined),
   list: () => [liveSession2],
   flush: async (session) => { flushed.push(session.id); return true },
+}
+
+// 假 sessionTitle 服务: 与真实 dsh-session-title 同形(rename 追加 session/title 事件并返回快照;
+// get 从事件流折叠最新标题)。titleServiceActive 供「服务缺失静默降级」用例开关。
+let titleServiceActive = true
+const fakeSessionTitle = {
+  rename: (session, title) => {
+    const snap = { title, messageSeqs: [], source: { kind: 'user' } }
+    const ev = { seq: session?.log?.length ?? session?.events?.length ?? 0, type: 'session/title', data: snap }
+    session?.log?.push(ev)
+    session?.events?.push(ev)
+    return snap
+  },
+  get: (session) => {
+    const evs = session?.events ?? session?.log ?? []
+    for (let i = evs.length - 1; i >= 0; i--) {
+      if (evs[i]?.type === 'session/title') return evs[i].data
+    }
+    return undefined
+  },
 }
 const fakePersistence = {
   list: async () => [{ version: 0, id: 'sess-persisted', createdAt: 1, cwd: FAKE_CWD }],
@@ -264,6 +288,7 @@ const ctx = {
     : name === 'agentDefaultModel' ? fakeDefaultModel
     : name === 'userQuestions' ? fakeUserQuestions
     : name === 'compaction' ? fakeCompaction
+    : name === 'sessionTitle' && titleServiceActive ? fakeSessionTitle
     : name === 'agentPresets' ? fakeAgentPresets
     : name === 'sandboxPolicy' ? fakeSandboxPolicy
     : name === 'approval' ? fakeApprovalService
@@ -483,7 +508,9 @@ try {
   const persistedRow = sessionsInner.sessions.find((s) => s.sessionId === 'sess-persisted')
   checks['session_list: 池/live 行带上下文占用'] = poolRow?.context !== null && liveRow?.context !== null
     && typeof poolRow?.context?.tokens === 'number' && typeof liveRow?.context?.tokens === 'number'
-  checks['session_list: 上下文带窗口与占用比'] = poolRow?.context?.window === 200 && poolRow?.context?.ratio === 0
+  // 注: 新会话自创建起就被自动命名(session/title 事件, 增量16), 池行日志含 1 条表面事件
+  // → tokens=10(1×10), ratio=10/200=5%; live 行(sess-live)为固定 30 tokens / 15%
+  checks['session_list: 上下文带窗口与占用比'] = poolRow?.context?.window === 200 && poolRow?.context?.ratio === 5
     && liveRow?.context?.tokens === 30 && liveRow?.context?.ratio === 15
   checks['session_list: 持久化行上下文为 null'] = persistedRow?.context === null
 
@@ -703,6 +730,13 @@ try {
   const apprNoticeIdx = apprLog.findIndex((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
   checks['notice: 审批提示在 tool/result 之后安全落点'] = apprFlushed.length === 2 && apprNoticeIdx > apprToolResultIdx
   checks['notice: 追加后模型消息序列合法(无 INVALID_REQUEST)'] = modelSequenceError(apprLog) === null
+  // 增量16: notice 原生呈现契约 —— form:'notice' 在 additionalContexts 路径上被保留(web UI 的
+  // contextForm → KNOWN_FORMS 含 'notice', 走 NoticeBody 专属呈现), 折叠行 summary 必须非空;
+  // 文案为 ⏳/✅ 系统状态措辞(「审批已由 MCP 接管/响应」), 而非底层调用叫法
+  checks['notice: 原生 notice 呈现契约(form:notice + summary 非空)'] = apprFlushed.length === 2
+    && apprFlushed.every((m) => m?.source?.form === 'notice' && typeof m.source.summary === 'string' && m.source.summary.length > 0)
+    && apprFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('⏳ 审批已由 MCP 接管'))
+    && apprFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('✅ 审批') && String(m.content?.[0]?.text ?? '').includes('已由 MCP 侧响应'))
   // 反向控制: 旧版错误插入(user/message 插在 assistant(tool_calls) 与 tool/result 之间)必须被校验器检出
   {
     const brokenLog = [
@@ -745,7 +779,7 @@ try {
   for (const msg of qFlushed) appendStep(qLog, { type: 'user/message', data: msg })
   const qNoticeIdx = qLog.findIndex((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
   checks['提问 notice: 在 tool/result 之后安全落点'] = qFlushed.length === 2 && qNoticeIdx > qToolResultIdx
-  checks['提问 notice: 含接管/回答提示且序列合法(无 INVALID_REQUEST)'] = qFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('MCP 侧接管'))
+  checks['提问 notice: 含接管/回答提示且序列合法(无 INVALID_REQUEST)'] = qFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('⏳ 提问已由 MCP 接管'))
     && qFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('已由 MCP 侧回答'))
     && modelSequenceError(qLog) === null
 
@@ -867,6 +901,33 @@ try {
   const presetResume = innerOf(await call(init.sid, 'agent_run', { task: 'preset resume', sessionId: 'sess-persisted', preset: 'code' }))
   checks['agent_run preset: resume 存量会话允许(挂载该 preset)'] = presetResume.sessionId === 'sess-persisted'
     && presetResume.mode?.preset === 'code'
+
+  // ── 增量16: 会话自动命名(新建会话未传 title 时按任务内容派生) + notice 原生呈现契约 ──
+  const TITLE_CWD = resolve(FAKE_CWD, 'title-zone')
+  const titleRun = await call(init.sid, 'agent_run', { task: '修复登录页 token 过期后的自动刷新逻辑并补单测', cwd: TITLE_CWD, timeoutMs: 3000 })
+  const titleInner = titleRun.status === 200 ? innerOf(titleRun) : { error: 'bad' }
+  checks['自动命名: 新会话结果带生成的 title'] = typeof titleInner.title === 'string' && titleInner.title.length > 0
+  checks['自动命名: 标题取自任务内容(首句派生且不超长)'] = typeof titleInner.title === 'string' && titleInner.title.length <= 60
+    && titleInner.title.includes('修复登录页')
+  const titleAgent = agentsById.get(String(titleInner.sessionId))
+  checks['自动命名: 会话日志落 session/title 事件(rename 生效)'] = (titleAgent?.session.log ?? []).some(
+    (e) => e.type === 'session/title' && e.data?.title === titleInner.title && e.data?.source?.kind === 'user')
+  const sess2 = innerOf(await call(init.sid, 'session_list', {}))
+  const titlePoolRow = sess2.sessions.find((s) => s.sessionId === String(titleInner.sessionId))
+  checks['自动命名: session_list 池行可见标题'] = titlePoolRow?.title === titleInner.title
+  // 显式 title 仍优先(自动派生不覆盖显式命名)
+  const explicitRun2 = await call(init.sid, 'agent_run', { task: '随便改点什么', cwd: resolve(FAKE_CWD, 'title-zone-2'), title: '我的显式标题', timeoutMs: 3000 })
+  const explicitInner2 = explicitRun2.status === 200 ? innerOf(explicitRun2) : { error: 'bad' }
+  checks['自动命名: 显式 title 优先(不派生覆盖)'] = explicitInner2.title === '我的显式标题'
+  // 复用会话不重命名: 续接 title-zone 会话, 标题保持首个任务派生的名字
+  const reuseTitle = innerOf(await call(init.sid, 'agent_run', { task: '后续任务不改名', sessionId: String(titleInner.sessionId) }))
+  checks['自动命名: 复用会话不改名(标题保持)'] = reuseTitle.title === titleInner.title
+  // sessionTitle 服务缺失: 静默降级(任务正常完成, 只是无标题), 不崩溃
+  titleServiceActive = false
+  const noSvc = await call(init.sid, 'agent_run', { task: 'no title svc', cwd: resolve(FAKE_CWD, 'title-zone-3'), timeoutMs: 3000 })
+  const noSvcInner = noSvc.status === 200 ? innerOf(noSvc) : { error: 'bad' }
+  checks['自动命名: sessionTitle 服务缺失时静默降级'] = Boolean(noSvcInner.sessionId) && noSvcInner.title === undefined
+  titleServiceActive = true
 
   // 窗口不可解析(resolveModelInfo 抛错/未知模型): window/ratio 必须为 null 而非崩溃, tokens 仍可读。
   // 放在流程末尾: newSession:true 会退役同 cwd 的池会话, 避免干扰前面的 session_set_model/session_inject 用例
