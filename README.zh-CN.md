@@ -31,6 +31,7 @@ Harness agent (flash) — 完整工具集: bash、fs、todo、web…
 | `harness_list_tools` | — | 列出 Harness 已注册的工具名 |
 | `harness_status` | Hermes ← Harness | 运维总览：队列 / agent 池 / live 会话 / 运行时配置 |
 | `model_list` | Hermes ← Harness | 列出所有已注册 provider 的模型（含已声明未激活的 provider）；`withWindow` 附加上下文窗口 |
+| `mode_list` | Hermes ← Harness | 列出会话**模式**：agent 预设（standard/code/cordis/minimal 等）、沙箱访问模式（read-only/workspace-write/danger-full-access）、审批策略（ask/never）与权限预设（捆绑，如 workspace-write = workspace-write + ask）；`modes` 给出可传给 `agent_run`/`task_inbox` 的 `mode=` 规范 id |
 | `workspace_list` | Hermes ← Harness | 列出工作区及其会话分组 |
 | `agent_run` | Hermes → Harness | 同步执行任务，返回结构化结果（传 `timeoutMs` 可把长任务自动转异步） |
 | `task_inbox` | Hermes → Harness | 把结构化任务（任务 + 记忆上下文 + cwd）推入异步队列（支持 per-task `timeoutMs`） |
@@ -56,9 +57,28 @@ Harness agent (flash) — 完整工具集: bash、fs、todo、web…
   "changes": "改了什么",
   "verification": "怎么验证的",
   "leftovers": "遗留问题",
-  "timeout": false
+  "timeout": false,
+  "context": { "events": 142, "tokens": 18340, "pressure": 21200, "window": 128000, "ratio": 14.3 },
+  "mode": { "preset": "standard", "sandbox": "workspace-write", "approval": "ask",
+            "permissionPreset": "workspace-write",
+            "requested": { "preset": "code", "sandbox": "workspace-write", "approval": "ask" } }
 }
 ```
+
+`mode` 块报告任务所用会话的生效模式（preset + 沙箱 + 审批 + 匹配的权限预设名）；`requested` 回显本次调用请求的模式，可据此验证指定模式已生效。
+
+### 会话模式
+
+DSH 会话的「模式」= 三个独立旋钮 + 它们的命名捆绑：
+
+| 类别 | 取值 | 来源 |
+|------|------|------|
+| Agent 预设 | `standard`（标准模式）、`code`（PTC 模式）、`cordis`（创造模式）、`minimal`（极简模式）等 | `ctx.agentPresets`（dsh agent-presets；setup 里挂载，session header 的 `agentPreset` 记录创建事实） |
+| 沙箱访问模式 | `read-only` / `workspace-write` / `danger-full-access` | 会话级覆盖 = `sandbox/mode` 会话日志事件（`ctx.sandboxPolicy` 提供部署默认） |
+| 审批策略 | `ask` / `never` | 会话级覆盖 = `approval/policy` 会话日志事件（`ctx.approval` 提供部署默认） |
+| 权限预设（捆绑） | 如 `workspace-write` = workspace-write + ask、`danger-full-access` = danger-full-access + never | `ctx.permissionPresets` 表 |
+
+`mode_list` 全量枚举上述内容（`only: "preset" | "sandbox" | "approval" | "permission"` 过滤，`withDetail: true` 附带更多元数据），其 `modes` 数组就是 `agent_run`/`task_inbox` 的 `mode=` 可接受的规范 id 空间。创建会话时传 `mode`/`preset`/`sandbox`/`approval` 即在创建时应用该模式（指定即强制全新会话），会话从第一轮起就跑在该模式下、避免任务中途再提权；结果与 `session_list` 会带 mode 快照验证生效。
 
 这打通了「客户端持久记忆 ↔ Harness 编码」的回路：记忆作为 `context` 喂给每个任务，结果（`changes` / `verification` / `leftovers`）可以写回客户端记忆，供下次续用。
 
@@ -78,6 +98,7 @@ agent 循环一旦卡死，任务会无限阻塞 MCP 客户端。有两道保护
 | `agent_run` / `task_inbox` 传 `sessionId` | 精确续接该会话（多轮投喂 / 断点恢复） |
 | `agent_run` / `task_inbox` 传 `newSession: true` | 本次强制全新会话；旧池会话退役（dispose）但持久化保留，仍可凭其 sessionId 续接 |
 | `agent_run` / `task_inbox` 传 `model` / `provider` | 按次模型覆盖（对新建/resume 会话生效；池复用的会话保持原模型） |
+| `agent_run` / `task_inbox` 传 `mode` / `preset` / `sandbox` / `approval` | 按指定模式创建会话：`preset` 挂载 agent 预设（standard/code/cordis/minimal 等，记入 session header 的 agentPreset）；`mode` 接受 `mode_list.modes` 的任一 id——权限预设名（捆绑，如 workspace-write = workspace-write + ask）、沙箱模式、审批策略或 preset id；`sandbox`/`approval` 显式覆盖捆绑值。指定任一即**强制全新会话**（池会话无法安全套用新模式），沙箱/审批以持久会话日志事件（`sandbox/mode` / `approval/policy`）落盘，会话自第一轮起就跑在该模式下、避免任务中途再提权；结果与 `session_list` 带 mode 快照验证生效。续接存量 `sessionId` 时 `sandbox`/`approval` 会被拒绝（需新建）；`preset` 单独允许（resume 的 setup 里挂载） |
 | *(都不传)* | 缺省：复用该 cwd 的常驻池会话 |
 | `session_list` | 盘点池 / live / 持久化三层会话（id、cwd、来源、标题、上下文占用），决定续接哪个 |
 | `session_read` | 续接前先读该会话的转录（文本/工具调用/结果），确认它做过什么 |

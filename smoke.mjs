@@ -12,6 +12,10 @@
 //   14. notice 安全落点(回归修复): 审批/提问拦截只入队不写日志; 工具完成后经 tools/post-execute
 //       并入 additionalContexts, 在 tool/result 之后追加 —— 不打断 assistant(tool_calls) 与其
 //       tool/result 的模型消息序列(无 INVALID_REQUEST); 反向控制验证旧版插入位置会被校验器检出
+//   15. 会话模式: mode_list 四类目录(agent preset / 沙箱模式 / 审批策略 / 权限预设)+ modes 汇总;
+//       agent_run/task_inbox 传 preset/mode/sandbox/approval 按模式创建会话(强制全新会话, meta.agentPreset
+//       记录 + 会话日志落 sandbox/mode、approval/policy 持久事件), 结果带 mode 快照验证生效;
+//       非法 mode 报错; sandbox/approval 不可续接存量会话, preset 单独允许 resume
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -57,6 +61,42 @@ const wsRegistry = {
 
 const inboxAppends = []
 const agentsById = new Map()
+const presetMounts = [] // agentPresets.mount 调用记录(agentCtx, presetId)
+
+// 假 agentPresets: 与真实 dsh-agent-presets 服务同形(list/resolve/defaultId/mount)
+const fakePresets = [
+  { id: 'standard', name: '标准模式', description: '功能完整的编码 Agent', trust: 'system', order: 1, path: '/presets/standard' },
+  { id: 'code', name: 'PTC 模式', description: '标准模式全部能力 + Code Mode SDK', trust: 'system', order: 2, path: '/presets/code' },
+  { id: 'cordis', name: '创造模式', description: '创建自定义 Agent preset', trust: 'system', order: 4, path: '/presets/cordis' },
+  { id: 'minimal', name: '极简模式', description: '双工具编码 Agent', trust: 'system', order: 3, path: '/presets/minimal' },
+]
+const fakeAgentPresets = {
+  list: async () => fakePresets,
+  resolve: async (id) => {
+    const p = fakePresets.find((x) => x.id === id)
+    if (!p) {
+      const e = new Error(`unknown preset ${id}`)
+      e.available = fakePresets.map((x) => x.id)
+      throw e
+    }
+    return p
+  },
+  defaultId: 'standard',
+  mount: async (agentCtx, id) => { presetMounts.push(id); return fakePresets.find((x) => x.id === id) ?? { id } },
+}
+
+// 假 sandboxPolicy / approval / permissionPresets: 与真实 dsh 服务同形
+const fakeSandboxPolicy = { defaultMode: 'read-only', workspaceRoot: '/ws' }
+const fakeApprovalService = { config: { policy: 'ask' } }
+const fakePermissionPresets = {
+  names: ['workspace-write', 'danger-full-access'],
+  resolve: (name) => (name === 'workspace-write'
+    ? { name, sandbox: 'workspace-write', approval: 'ask', description: '工作区可写 + 每次审批' }
+    : name === 'danger-full-access'
+      ? { name, sandbox: 'danger-full-access', approval: 'never', description: '完全访问 + 永不询问' }
+      : undefined),
+  defaultPreset: 'workspace-write',
+}
 
 function makeAgent(id, cwd) {
   const log = []
@@ -147,7 +187,7 @@ const ctx = {
     list: () => [liveAgent],
     create: async ({ sessionId, meta, agentOptions }) => {
       const id = String(sessionId)
-      created.push({ id, cwd: meta?.cwd, options: agentOptions })
+      created.push({ id, cwd: meta?.cwd, preset: meta?.agentPreset, options: agentOptions })
       const agent = makeAgent(id, meta?.cwd)
       // 应用 create 传入的 agentOptions(真实 dsh 会把 options 写到 agent.options)
       if (agentOptions) {
@@ -204,7 +244,7 @@ const ctx = {
       return { agent, dispose: async () => { disposed.push(id) } }
     },
   },
-  agentPresets: { mount: async () => ({ id: 'standard' }) },
+  agentPresets: fakeAgentPresets,
   sessions: fakeSessions,
   sessionPersistence: fakePersistence,
   workspaceRegistry: wsRegistry,
@@ -224,6 +264,10 @@ const ctx = {
     : name === 'agentDefaultModel' ? fakeDefaultModel
     : name === 'userQuestions' ? fakeUserQuestions
     : name === 'compaction' ? fakeCompaction
+    : name === 'agentPresets' ? fakeAgentPresets
+    : name === 'sandboxPolicy' ? fakeSandboxPolicy
+    : name === 'approval' ? fakeApprovalService
+    : name === 'permissionPresets' ? fakePermissionPresets
     : undefined),
 }
 let disposer = () => {}
@@ -336,7 +380,7 @@ try {
   const toolsList = await rpc(init.sid, { jsonrpc: '2.0', id: ++rid, method: 'tools/list', params: {} })
   const toolNames = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
   for (const t of ['attach_session', 'task_list', 'task_cancel', 'session_list', 'session_close', 'session_compact',
-    'harness_status', 'model_list', 'workspace_list', 'session_read', 'task_wait',
+    'harness_status', 'model_list', 'mode_list', 'workspace_list', 'session_read', 'task_wait',
     'pending_prompts', 'prompt_respond', 'session_set_model', 'session_inject']) {
     checks[`工具清单含 ${t}`] = toolNames.includes(t)
   }
@@ -742,6 +786,87 @@ try {
     && inboxAppends.some((x) => String(x.m?.content?.[0]?.text ?? '').includes('git status') && x.t === 'next-turn')
   const injUnknown = await call(init.sid, 'session_inject', { sessionId: 'sess-unknown', message: 'x' })
   checks['session_inject: 未知会话报错'] = String(innerOf(injUnknown).error ?? '').includes('session not found')
+
+  // ── 增量15: 会话模式 —— mode_list 目录 + agent_run/task_inbox 按模式创建会话 ──
+  // mode_list: 四类目录 + modes 汇总(可传给 mode= 的规范 id) + 部署默认
+  const modes = innerOf(await call(init.sid, 'mode_list', {}))
+  checks['mode_list: 列出 agent presets(standard 默认)'] = Array.isArray(modes.presets)
+    && modes.presets.some((p) => p.id === 'standard' && p.default === true)
+    && modes.presets.some((p) => p.id === 'code' && p.default === false)
+  checks['mode_list: 列出沙箱模式(3 个, read-only 默认)'] = Array.isArray(modes.sandboxModes)
+    && modes.sandboxModes.length === 3
+    && modes.sandboxModes.find((s) => s.id === 'read-only')?.default === true
+    && modes.sandboxModes.some((s) => s.id === 'workspace-write')
+  checks['mode_list: 列出审批策略(ask 默认)'] = Array.isArray(modes.approvalPolicies)
+    && modes.approvalPolicies.length === 2
+    && modes.approvalPolicies.find((a) => a.id === 'ask')?.default === true
+  checks['mode_list: 权限预设(workspace-write = 沙箱 workspace-write + 审批 ask)'] = Array.isArray(modes.permissionPresets)
+    && modes.permissionPresets.some((pp) => pp.id === 'workspace-write' && pp.sandbox === 'workspace-write'
+      && pp.approval === 'ask' && pp.default === true)
+  checks['mode_list: modes 汇总含可传 mode= 的规范 id'] = Array.isArray(modes.modes)
+    && modes.modes.some((m) => m.id === 'workspace-write' && m.kind === 'permission')
+    && modes.modes.some((m) => m.id === 'standard' && m.kind === 'preset')
+    && modes.modes.some((m) => m.id === 'ask' && m.kind === 'approval')
+    && modes.modes.some((m) => m.id === 'read-only' && m.kind === 'sandbox')
+  checks['mode_list: 部署默认(deployment)'] = modes.deployment?.defaultPreset === 'standard'
+    && modes.deployment?.defaultSandboxMode === 'read-only'
+    && modes.deployment?.defaultApprovalPolicy === 'ask'
+  const modesOnly = innerOf(await call(init.sid, 'mode_list', { only: 'preset' }))
+  checks['mode_list: only=preset 只列 preset'] = Array.isArray(modesOnly.presets)
+    && modesOnly.presets.length >= 1 && modesOnly.sandboxModes === undefined && modesOnly.modes === undefined
+  const modesDetail = innerOf(await call(init.sid, 'mode_list', { withDetail: true }))
+  checks['mode_list: withDetail 附带路径等细节'] = typeof modesDetail.presets?.[0]?.path === 'string'
+    && typeof modesDetail.sandboxModes?.[0]?.kind === 'string'
+
+  // agent_run 按模式创建会话: preset + mode(权限预设名) → 强制全新会话, 创建时应用, 结果验证生效
+  const MODE_CWD = resolve(FAKE_CWD, 'mode-zone')
+  const modeRun = await call(init.sid, 'agent_run', { task: 'mode test', cwd: MODE_CWD, preset: 'code', mode: 'workspace-write', timeoutMs: 3000 })
+  const modeInner = modeRun.status === 200 ? innerOf(modeRun) : { error: 'bad' }
+  const modeCreated = created[created.length - 1]
+  checks['agent_run mode: 强制全新会话(不池复用)'] = Boolean(modeInner.sessionId) && modeInner.sessionId === modeCreated?.id
+  checks['agent_run preset: meta.agentPreset 记录到创建事实'] = modeCreated?.preset === 'code'
+  checks['agent_run mode: 结果 mode 快照生效(requested == effective)'] = modeInner.mode?.requested?.preset === 'code'
+    && modeInner.mode?.preset === 'code'
+    && modeInner.mode?.sandbox === 'workspace-write' && modeInner.mode?.approval === 'ask'
+    && modeInner.mode?.permissionPreset === 'workspace-write'
+  const modeAgent = agentsById.get(modeCreated?.id)
+  checks['agent_run mode: 会话日志落 sandbox/mode + approval/policy 持久事件'] = (modeAgent?.session.log ?? []).some(
+    (e) => e.type === 'sandbox/mode' && e.data?.mode === 'workspace-write')
+    && (modeAgent?.session.log ?? []).some((e) => e.type === 'approval/policy' && e.data?.policy === 'ask')
+
+  // mode: 权限预设名 danger-full-access(= 沙箱 danger-full-access + 审批 never); 再指定时再次强制全新会话
+  const fullRun = await call(init.sid, 'agent_run', { task: 'full access', cwd: MODE_CWD, mode: 'danger-full-access', timeoutMs: 3000 })
+  const fullInner = fullRun.status === 200 ? innerOf(fullRun) : { error: 'bad' }
+  checks['agent_run mode=danger-full-access: 捆绑沙箱+审批生效'] = fullInner.mode?.sandbox === 'danger-full-access'
+    && fullInner.mode?.approval === 'never' && fullInner.mode?.permissionPreset === 'danger-full-access'
+  checks['agent_run mode: 再次指定仍强制全新会话'] = Boolean(fullInner.sessionId) && fullInner.sessionId !== modeInner.sessionId
+
+  // 显式 sandbox/approval 细粒度控制(覆盖 mode 捆绑)
+  const explicitRun = await call(init.sid, 'agent_run', { task: 'explicit', cwd: MODE_CWD, sandbox: 'read-only', approval: 'never', timeoutMs: 3000 })
+  const explicitInner = explicitRun.status === 200 ? innerOf(explicitRun) : { error: 'bad' }
+  checks['agent_run sandbox+approval 显式: 生效'] = explicitInner.mode?.sandbox === 'read-only'
+    && explicitInner.mode?.approval === 'never' && explicitInner.mode?.permissionPreset === undefined
+
+  // task_inbox 按模式: 异步结果也带 mode 验证
+  const modeInbox = innerOf(await call(init.sid, 'task_inbox', { task: 'inbox mode', cwd: resolve(FAKE_CWD, 'mode-zone-2'), mode: 'workspace-write' }))
+  let modeInboxDone
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 50))
+    const inner = innerOf(await call(init.sid, 'task_result', { taskId: modeInbox.taskId }))
+    if (inner.status === 'done' || inner.status === 'error') { modeInboxDone = inner; break }
+  }
+  checks['task_inbox mode: 异步结果带 mode 快照(沙箱+审批生效)'] = modeInboxDone?.result?.mode?.sandbox === 'workspace-write'
+    && modeInboxDone?.result?.mode?.approval === 'ask' && modeInboxDone?.result?.mode?.permissionPreset === 'workspace-write'
+
+  // 非法值 / 存量会话约束: 立即报错不排队
+  const modeBad = innerOf(await call(init.sid, 'agent_run', { task: 'x', cwd: MODE_CWD, mode: 'nope-mode' }))
+  checks['agent_run mode 非法值报错'] = String(modeBad.error ?? '').includes('unknown mode')
+  const modeResume = innerOf(await call(init.sid, 'agent_run', { task: 'x', sessionId: 'sess-live', mode: 'workspace-write' }))
+  checks['mode+sandbox/approval 不可续接存量会话(需新建)'] = String(modeResume.error ?? '').includes('only apply when creating a new session')
+  // preset 单独允许 resume(在 setup 挂载该 preset)
+  const presetResume = innerOf(await call(init.sid, 'agent_run', { task: 'preset resume', sessionId: 'sess-persisted', preset: 'code' }))
+  checks['agent_run preset: resume 存量会话允许(挂载该 preset)'] = presetResume.sessionId === 'sess-persisted'
+    && presetResume.mode?.preset === 'code'
 
   // 窗口不可解析(resolveModelInfo 抛错/未知模型): window/ratio 必须为 null 而非崩溃, tokens 仍可读。
   // 放在流程末尾: newSession:true 会退役同 cwd 的池会话, 避免干扰前面的 session_set_model/session_inject 用例

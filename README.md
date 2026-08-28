@@ -29,6 +29,7 @@ Harness agent (flash) — full toolset: bash, fs, todo, web…
 | `harness_list_tools` | — | List Harness's registered tool names |
 | `harness_status` | Hermes ← Harness | Operations overview: queue / agent pool / live agents / runtime config |
 | `model_list` | Hermes ← Harness | List every registered provider's models (plus declared-but-inactive providers); `withWindow` adds context windows |
+| `mode_list` | Hermes ← Harness | List session **modes**: agent presets (`standard`/`code`/`cordis`/`minimal`…), sandbox access modes (`read-only`/`workspace-write`/`danger-full-access`), approval policies (`ask`/`never`), and named permission presets (bundles, e.g. `workspace-write` = workspace-write + ask); `modes` gives the canonical ids you can pass to `agent_run`/`task_inbox` `mode=` |
 | `workspace_list` | Hermes ← Harness | List workspaces and their session groups |
 | `agent_run` | Hermes → Harness | Run a task synchronously and return a structured result (pass `timeoutMs` to auto-convert long tasks to async) |
 | `task_inbox` | Hermes → Harness | Push a structured task (task + memory context + cwd) to an async queue (`timeoutMs` per-task override) |
@@ -54,9 +55,28 @@ Every task result is **structured**:
   "changes": "what was changed",
   "verification": "how it was verified",
   "leftovers": "open issues",
-  "timeout": false
+  "timeout": false,
+  "context": { "events": 142, "tokens": 18340, "pressure": 21200, "window": 128000, "ratio": 14.3 },
+  "mode": { "preset": "standard", "sandbox": "workspace-write", "approval": "ask",
+            "permissionPreset": "workspace-write",
+            "requested": { "preset": "code", "sandbox": "workspace-write", "approval": "ask" } }
 }
 ```
+
+The `mode` block reports the session's effective mode (preset + sandbox + approval + matching permission-preset name); `requested` echoes what this call asked for, so you can verify a requested mode took effect.
+
+### Session modes
+
+A DSH session's **mode** is three independent knobs, plus named bundles over them:
+
+| Category | Values | Source |
+|----------|--------|--------|
+| Agent preset | `standard` (标准模式), `code` (PTC 模式), `cordis` (创造模式), `minimal` (极简模式), … | `ctx.agentPresets` (dsh agent-presets; mounted in setup, recorded in the session header's `agentPreset`) |
+| Sandbox access mode | `read-only` / `workspace-write` / `danger-full-access` | per-session override = `sandbox/mode` session-log event (`ctx.sandboxPolicy` default) |
+| Approval policy | `ask` / `never` | per-session override = `approval/policy` session-log event (`ctx.approval` default) |
+| Permission preset (bundle) | e.g. `workspace-write` = workspace-write + ask, `danger-full-access` = danger-full-access + never | `ctx.permissionPresets` table |
+
+`mode_list` enumerates all of it — with `only: "preset" | "sandbox" | "approval" | "permission"` to filter and `withDetail: true` for extra metadata — and its `modes` array is the canonical id space accepted by `agent_run`/`task_inbox` `mode=`. Creating a session with `mode`/`preset`/`sandbox`/`approval` applies the mode at creation time (forcing a fresh session), so the session runs under it from the first turn and avoids mid-task privilege escalation; results and `session_list` verify what took effect.
 
 This closes the loop between the client's persistent memory and Harness's coding: memory is fed into each task as `context`, and the result (`changes` / `verification` / `leftovers`) can be persisted back to the client's memory for the next run.
 
@@ -76,6 +96,7 @@ Sessions are **reused per cwd by default** (one resident pool session per cwd, L
 | `agent_run` / `task_inbox` `sessionId: ...` | Continue that exact session (multi-round feeding / resume after interrupt) |
 | `agent_run` / `task_inbox` `newSession: true` | Force a brand-new session for this call; the old pooled session is retired (disposed) but stays persisted and resumable by its `sessionId` |
 | `agent_run` / `task_inbox` `model` / `provider` | Per-call model override (applies to new / resumed sessions; a pooled-reuse session keeps its original model) |
+| `agent_run` / `task_inbox` `mode` / `preset` / `sandbox` / `approval` | Create the session **in a given mode**: `preset` mounts an agent preset (`standard`/`code`/`cordis`/`minimal`…, recorded in the session header's `agentPreset`); `mode` accepts any `mode_list.modes` id — a permission-preset name (bundle, e.g. `workspace-write` = workspace-write + ask), a sandbox mode, an approval policy, or a preset id; `sandbox`/`approval` override the bundle explicitly. Specifying any of these **forces a brand-new session** (a pooled session cannot safely adopt a new mode), and the sandbox/approval knobs are written as durable `sandbox/mode` / `approval/policy` session-log events so the session runs under that mode from its first turn — no mid-task privilege escalation. The result and `session_list` carry a `mode` snapshot verifying what took effect. `sandbox`/`approval` are rejected when resuming an existing `sessionId`; `preset` alone is allowed on resume (mounted in setup) |
 | *(neither)* | Default: reuse the cwd's pooled session |
 | `session_list` | See pool / live / persisted sessions (id, cwd, source, title, context usage) to decide what to continue |
 | `session_read` | Read a session's transcript (text, tool calls, results) before deciding to continue it |

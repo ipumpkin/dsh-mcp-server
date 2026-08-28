@@ -8,6 +8,7 @@
  *   - harness_list_tools  : 列出 Harness 工具注册表
  *   - harness_status      : 系统水位总览(队列/agent 池/live 会话/运行时配置)
  *   - model_list          : 列出 provider 的模型目录, 供按任务选模型
+ *   - mode_list           : 列出会话模式目录(agent preset / 沙箱访问模式 / 审批策略 / 权限预设), 供按任务选模式
  *   - workspace_list      : 列出工作区及其会话分组
  *   - agent_run           : 同步执行任务(改代码/分析/跑命令), 返回结构化结果
  *   - task_inbox          : Hermes push 结构化任务(任务+记忆上下文)到 Harness 队列, 异步执行, 返回 taskId
@@ -24,6 +25,13 @@
  *   - session_inject      : 向指定会话的 agent 队列插入补充指令(steering), 不打断当前工具执行
  *   - attach_session      : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session      : 给已有会话改名
+ *
+ * 会话模式: DSH 会话的「模式」= agent 预设(standard/code/cordis/minimal 等, 来自 dsh agent-presets,
+ * 经 ctx.agentPresets.mount 挂载, meta.agentPreset 记入 session header)+ 沙箱访问模式(read-only /
+ * workspace-write / danger-full-access, 会话级覆盖 = sandbox/mode 日志事件)+ 审批策略(ask / never,
+ * 覆盖 = approval/policy 日志事件)。权限预设(ctx.permissionPresets)把沙箱+审批捆绑命名(如
+ * workspace-write = workspace-write + ask)。agent_run/task_inbox 传 preset/mode/sandbox/approval 可在
+ * 创建会话时应用模式(指定即强制全新会话, 避免后续再提权); 结果带 mode 快照验证生效, mode_list 列出可用模式。
  *
  * 上下文占用: session_list/task_list 与任务 result/progress(agent_run/task_inbox/task_result/task_wait)
  * 经 ctx.tokenMeter.measure(session) 输出事件数与启发式 token 数(固定密度定价, 与 dsh token-meter 同源),
@@ -55,7 +63,7 @@ import type { Context } from '@deepseek-ai/cordis';
 /** Cordis 插件名 */
 export declare const name = "harness-mcp-server";
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export declare const VERSION = "0.9.6";
+export declare const VERSION = "0.9.7";
 /**
  * 声明依赖的核心服务。
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——
