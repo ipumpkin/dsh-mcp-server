@@ -18,6 +18,10 @@
  *   - session_read        : 读会话事件流(文本/工具调用/结果), 审计或续接前回顾
  *   - session_close       : 显式退役一个池会话(持久化保留, 可凭 sessionId 续接)
  *   - session_compact     : 把会话早期历史压缩成一段模型摘要(需宿主加载 compaction 后端, 如 dsh-compaction-basic)
+ *   - pending_prompts     : 列出等待输入的弹窗(审批/提问)——MCP 调用方对 DSH 弹窗不再盲目
+ *   - prompt_respond      : 响应弹窗(审批 approve/deny, 提问自由文本), 解除 agent 阻塞继续
+ *   - session_set_model   : 给指定会话切换模型(改 agent.options.model, 下个 turn 生效)
+ *   - session_inject      : 向指定会话的 agent 队列插入补充指令(steering), 不打断当前工具执行
  *   - attach_session      : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session      : 给已有会话改名
  *

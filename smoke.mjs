@@ -29,6 +29,14 @@ const HANG_CWD2 = resolve(FAKE_CWD, 'hang-zone-2')
 const HANG_CWD3 = resolve(FAKE_CWD, 'hang-zone-3')
 const HANG_CWD4 = resolve(FAKE_CWD, 'hang-zone-4')
 const HANG_SET = new Set([HANG_CWD, HANG_CWD2, HANG_CWD3, HANG_CWD4])
+// 审批弹窗 / 模型失败专用 cwd
+const APPROVAL_CWD = resolve(FAKE_CWD, 'approval-zone')
+const ERROR_CWD = resolve(FAKE_CWD, 'error-zone')
+
+// 事件注册表 + 用户提问 provider 捕获(prepend 顺序用于验证审批应答者优先级)
+const eventHandlers = new Map()
+let capturedProvider
+const fakeUserQuestions = { registerProvider: (p) => { capturedProvider = p; return () => { capturedProvider = undefined } } }
 
 const fakeWs = {
   id: 'ws-fake',
@@ -43,8 +51,12 @@ const wsRegistry = {
   create: async () => fakeWs,
 }
 
+const inboxAppends = []
+const agentsById = new Map()
+
 function makeAgent(id, cwd) {
   return {
+    id,
     session: { id, log: [], events: [], header: { version: 0, id, createdAt: Date.now(), cwd } },
     options: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
     status: 'idle',
@@ -52,6 +64,7 @@ function makeAgent(id, cwd) {
     whenIdle: async () => {},
     cancel: () => {},
     runMaintenance: async (task) => task(new AbortController().signal),
+    inbox: { append: (t, m) => { inboxAppends.push({ t, m }) } },
   }
 }
 
@@ -116,6 +129,12 @@ const ctx = {
       const id = String(sessionId)
       created.push({ id, cwd: meta?.cwd, options: agentOptions })
       const agent = makeAgent(id, meta?.cwd)
+      // 应用 create 传入的 agentOptions(真实 dsh 会把 options 写到 agent.options)
+      if (agentOptions) {
+        if (agentOptions.provider !== undefined) agent.options.provider = agentOptions.provider
+        if (agentOptions.model !== undefined) agent.options.model = agentOptions.model
+      }
+      agentsById.set(id, agent)
       // 卡死 agent: whenIdle 只在 cancel 后落定(模拟真实 dsh: cancel 打断活动回合)
       if (HANG_SET.has(meta?.cwd)) {
         let released = false
@@ -123,13 +142,41 @@ const ctx = {
         agent.whenIdle = () => (released ? Promise.resolve() : new Promise((res) => { release = () => { released = true; res() } }))
         agent.cancel = () => { release?.() }
       }
+      // 审批弹窗 agent: followup 时模拟 DSH ApprovalService —— 追加 asked 审计 + waterfall 派发到应答链
+      if (meta?.cwd === APPROVAL_CWD) {
+        let settleTurn
+        agent.followup = () => {
+          if (agent._approvalFired) return
+          agent._approvalFired = true
+          agent.session.events.push({ type: 'approval/asked', data: { id: 'appr-e2e-1', toolName: 'bash', callId: 'c-1' } })
+          const ac = new AbortController()
+          const req = { agent, toolName: 'bash', callId: 'c-1', reason: 'write outside workspace root', signal: ac.signal }
+          const chain = [...(eventHandlers.get('approval/request') ?? [])]
+          const run = async () => { const h = chain.shift(); return h ? h(req, run) : 'unavailable' }
+          run().then((o) => {
+            agent.approvalOutcome = o
+            agent.session.events.push({ type: 'approval/decided', data: { id: 'appr-e2e-1', outcome: o } })
+            settleTurn?.()
+          })
+        }
+        agent.whenIdle = () => new Promise((res) => { settleTurn = res })
+      }
+      // 模型失败 agent: followup 时写入 failed turn/end(模拟 LLM 配额/网络错误)
+      if (meta?.cwd === ERROR_CWD) {
+        agent.followup = () => {
+          agent.session.log.push({ seq: agent.session.log.length, type: 'turn/start', data: { turn: 0 } })
+          agent.session.log.push({ seq: agent.session.log.length, type: 'turn/end', data: { turn: 0, reason: { kind: 'failed', error: { code: 'RATE_LIMITED', message: 'quota exhausted' } } } })
+        }
+      }
       return { agent, dispose: async () => { disposed.push(id) } }
     },
     resume: async ({ resumeSessionId }) => {
       const id = String(resumeSessionId)
       if (id !== 'sess-persisted') throw new Error(`no persisted session "${id}"`)
       resumed.push(id)
-      return { agent: makeAgent(id, FAKE_CWD), dispose: async () => { disposed.push(id) } }
+      const agent = makeAgent(id, FAKE_CWD)
+      agentsById.set(id, agent)
+      return { agent, dispose: async () => { disposed.push(id) } }
     },
   },
   agentPresets: { mount: async () => ({ id: 'standard' }) },
@@ -137,12 +184,20 @@ const ctx = {
   sessionPersistence: fakePersistence,
   workspaceRegistry: wsRegistry,
   effect: (fn) => { disposer = fn(); return disposer },
+  // 事件注册(prepend 支持)+ 用户提问 provider 捕获 —— 供审批应答者/提问 provider 注册
+  on: (name, handler, options) => {
+    const list = eventHandlers.get(name) ?? []
+    if (options?.prepend) list.unshift(handler); else list.push(handler)
+    eventHandlers.set(name, list)
+    return () => { const i = list.indexOf(handler); if (i >= 0) list.splice(i, 1) }
+  },
   get: (name) => (name === 'workspaceRegistry' ? wsRegistry
     : name === 'sessions' ? fakeSessions
     : name === 'sessionPersistence' ? fakePersistence
     : name === 'tokenMeter' ? fakeMeter
     : name === 'llm' ? fakeLlm
     : name === 'agentDefaultModel' ? fakeDefaultModel
+    : name === 'userQuestions' ? fakeUserQuestions
     : name === 'compaction' ? fakeCompaction
     : undefined),
 }
@@ -190,6 +245,10 @@ const call = (sessionId, name, args) => rpc(sessionId, {
   params: { name, arguments: args ?? {} },
 })
 try {
+  // 模拟 web GUI 的审批应答者: 先注册(在我们的应答者之前), 验证 prepend 抢序 + 非 MCP 会话放行
+  const guiHandler = (req, next) => Promise.resolve('gui-claimed')
+  ctx.on('approval/request', guiHandler, { prepend: false })
+
   await apply(ctx, { port: PORT, host: '127.0.0.1', taskTimeoutMs: 600, workspaceRoots: [FAKE_CWD] })
   await new Promise((r) => setTimeout(r, 400))
 
@@ -206,7 +265,8 @@ try {
   const toolsList = await rpc(init.sid, { jsonrpc: '2.0', id: ++rid, method: 'tools/list', params: {} })
   const toolNames = parsePayload(toolsList.text).result?.tools?.map((t) => t.name) ?? []
   for (const t of ['attach_session', 'task_list', 'task_cancel', 'session_list', 'session_close', 'session_compact',
-    'harness_status', 'model_list', 'workspace_list', 'session_read', 'task_wait']) {
+    'harness_status', 'model_list', 'workspace_list', 'session_read', 'task_wait',
+    'pending_prompts', 'prompt_respond', 'session_set_model', 'session_inject']) {
     checks[`工具清单含 ${t}`] = toolNames.includes(t)
   }
 
@@ -454,6 +514,83 @@ try {
   const attachOutside = await call(init.sid, 'attach_session', { sessionId: 'sess-persisted', path: '/tmp' })
   checks['attach_session 越界路径被白名单拒绝'] = attachOutside.status === 200
     && String(innerOf(attachOutside).error ?? '').includes('not allowed')
+
+  // ── 增量12: 弹窗感知与响应(审批绝不自动放行; 提问可程序化回答) ──
+  checks['审批应答者 prepend 优先于 GUI'] = eventHandlers.get('approval/request')?.[0] !== guiHandler
+  {
+    const bareAgent = makeAgent('bare-sess', FAKE_CWD)
+    bareAgent.session.events.push({ type: 'approval/asked', data: { id: 'appr-bare', toolName: 'bash', callId: 'c-9' } })
+    const bareReq = { agent: bareAgent, toolName: 'bash', callId: 'c-9', reason: 'x', signal: new AbortController().signal }
+    const chain2 = [...(eventHandlers.get('approval/request') ?? [])]
+    const run2 = async () => { const h = chain2.shift(); return h ? h(bareReq, run2) : 'unavailable' }
+    checks['非 MCP 会话审批放行给 GUI 应答链'] = (await run2()) === 'gui-claimed'
+  }
+  // 审批流程: task_inbox → 感知 waiting_input → prompt_respond approve → 任务继续并完成
+  const apprInbox = await call(init.sid, 'task_inbox', { task: 'write outside', cwd: APPROVAL_CWD })
+  const apprId = innerOf(apprInbox).taskId
+  let apprProg
+  for (let i = 0; i < 100; i++) {
+    await new Promise((r) => setTimeout(r, 50))
+    const inner = innerOf(await call(init.sid, 'task_result', { taskId: apprId }))
+    if (inner.progress?.status === 'waiting_input') { apprProg = inner.progress; break }
+  }
+  checks['审批弹窗感知: progress waiting_input + 原文'] = apprProg?.status === 'waiting_input'
+    && apprProg.prompts?.[0]?.type === 'approval' && apprProg.prompts[0].id === 'appr-e2e-1'
+    && String(apprProg.prompts[0].reason ?? '').includes('outside')
+  const apprList = innerOf(await call(init.sid, 'pending_prompts', {}))
+  checks['pending_prompts: 列出审批弹窗'] = apprList.prompts.some((p) => p.type === 'approval' && p.id === 'appr-e2e-1')
+  const apprResp = await call(init.sid, 'prompt_respond', { sessionId: apprList.prompts.find((p) => p.type === 'approval').sessionId, promptId: 'appr-e2e-1', decision: 'approve' })
+  checks['prompt_respond: 审批 approve→allowed-once'] = innerOf(apprResp).resolved === 'allowed-once'
+  let apprDone
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 50))
+    const inner = innerOf(await call(init.sid, 'task_result', { taskId: apprId }))
+    if (inner.status === 'done' || inner.status === 'error') { apprDone = inner; break }
+  }
+  checks['审批后任务继续并完成'] = apprDone?.status === 'done'
+    && agentsById.get(String(apprDone?.result?.sessionId))?.approvalOutcome === 'allowed-once'
+
+  // 提问流程: 模拟 ask_user_question 走我们持有的 provider → 感知 → prompt_respond answer → 解除阻塞
+  const qAgent = agentsById.get(String(created[4]?.id))
+  const askPromise = capturedProvider.ask({
+    questions: [{ id: 'q1', question: 'Which DB?', options: [{ label: 'pg' }, { label: 'mysql' }] }],
+    agent: qAgent,
+    signal: new AbortController().signal,
+  })
+  await new Promise((r) => setTimeout(r, 100))
+  const ppQ = innerOf(await call(init.sid, 'pending_prompts', { sessionId: String(created[4]?.id) }))
+  const qPrompt = ppQ.prompts.find((p) => p.type === 'question')
+  checks['pending_prompts: 列出提问弹窗(含原文)'] = qPrompt !== undefined && qPrompt.questions?.[0]?.question === 'Which DB?'
+  const respQ = await call(init.sid, 'prompt_respond', { sessionId: String(created[4]?.id), promptId: qPrompt.id, answer: 'pg' })
+  checks['prompt_respond: 提问自由文本回答'] = innerOf(respQ).ok === true
+  const qAnswer = await askPromise
+  checks['提问 provider 收到回答'] = qAnswer.answers?.[0]?.custom === 'pg'
+
+  // ── 增量13: 模型/执行失败反映到任务结果 + 切模型 + 注入 ──
+  const errInbox = await call(init.sid, 'task_inbox', { task: 'boom', cwd: ERROR_CWD })
+  let errDone
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 50))
+    const inner = innerOf(await call(init.sid, 'task_result', { taskId: innerOf(errInbox).taskId }))
+    if (inner.status === 'done' || inner.status === 'error') { errDone = inner; break }
+  }
+  checks['模型错误: 任务 status=error + 结构化 error'] = errDone?.status === 'error'
+    && errDone?.result?.error?.errorCode === 'RATE_LIMITED' && errDone?.result?.error?.errorCategory === 'model'
+    && String(errDone?.error ?? '').includes('RATE_LIMITED')
+  const errSync = await call(init.sid, 'agent_run', { task: 'boom sync', cwd: ERROR_CWD, timeoutMs: 3000 })
+  checks['agent_run 同步路径模型错误 isError'] = parsePayload(errSync.text).result?.isError === true
+    && String(innerOf(errSync).error ?? '').includes('RATE_LIMITED')
+
+  const setModel = await call(init.sid, 'session_set_model', { sessionId: String(created[4]?.id), model: 'glm-5.3' })
+  const sm = innerOf(setModel)
+  checks['session_set_model: 返回新旧模型'] = sm.ok === true && sm.oldModel === 'custom-model' && sm.newModel === 'glm-5.3'
+  checks['session_set_model: agent.options 已切换'] = agentsById.get(String(created[4]?.id))?.options?.model === 'glm-5.3'
+
+  const inj = await call(init.sid, 'session_inject', { sessionId: String(created[4]?.id), message: '请先用 git status 看改动' })
+  checks['session_inject: 插入 steering 消息'] = innerOf(inj).ok === true
+    && inboxAppends.some((x) => String(x.m?.content?.[0]?.text ?? '').includes('git status') && x.t === 'next-turn')
+  const injUnknown = await call(init.sid, 'session_inject', { sessionId: 'sess-unknown', message: 'x' })
+  checks['session_inject: 未知会话报错'] = String(innerOf(injUnknown).error ?? '').includes('session not found')
 
   // ── 增量3: 启动存量捞回(sessions.list + sessionPersistence.list 两源) ──
   await new Promise((r) => setTimeout(r, 500))

@@ -18,6 +18,10 @@
  *   - session_read        : 读会话事件流(文本/工具调用/结果), 审计或续接前回顾
  *   - session_close       : 显式退役一个池会话(持久化保留, 可凭 sessionId 续接)
  *   - session_compact     : 把会话早期历史压缩成一段模型摘要(需宿主加载 compaction 后端, 如 dsh-compaction-basic)
+ *   - pending_prompts     : 列出等待输入的弹窗(审批/提问)——MCP 调用方对 DSH 弹窗不再盲目
+ *   - prompt_respond      : 响应弹窗(审批 approve/deny, 提问自由文本), 解除 agent 阻塞继续
+ *   - session_set_model   : 给指定会话切换模型(改 agent.options.model, 下个 turn 生效)
+ *   - session_inject      : 向指定会话的 agent 队列插入补充指令(steering), 不打断当前工具执行
  *   - attach_session      : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session      : 给已有会话改名
  *
@@ -208,7 +212,11 @@ async function getAgent(
 ): Promise<ResolvedAgent> {
   // 恒解析生效模型(显式覆盖 → 插件配置 → agentDefaultModel): 预设 persona 引用 {{model}},
   // agent.options.model 缺失会让 prompt 组装抛 "has no value for this assembly" 并空跑本轮。
-  const agentOptions = resolveAgentModel(ctx, modelOpts)
+  // 指定 sessionId 时优先采用 session_set_model 记录的会话级覆盖(resume 后依然生效)。
+  const sessionOverride = sessionId !== undefined ? sessionModelOverrides.get(sessionId) : undefined
+  const agentOptions = sessionOverride
+    ? { provider: sessionOverride.provider ?? modelOpts?.provider ?? runtimeConfig.provider, model: sessionOverride.model }
+    : resolveAgentModel(ctx, modelOpts)
   // 指定 sessionId: 接管已有会话(长任务分多轮投喂 / 中断后恢复 / UI 手开的会话)
   if (sessionId) {
     // 先看本进程常驻池(指定 sessionId 时定位到对应 cwd 的常驻会话; 命中 LRU 移到末尾, 保留上游语义)
@@ -371,6 +379,8 @@ interface TaskResult {
   leftovers: string
   /** true = 任务超时被自动 cancel(部分输出已回收, 可用 sessionId 续接) */
   timeout?: boolean
+  /** 模型/执行失败(配额耗尽/网络/非法参数等): errorCategory = model(LLM 错误码) | execution(通用 UNKNOWN), 有值即本轮失败 */
+  error?: { errorCode: string; errorMessage: string; errorCategory: 'model' | 'execution' }
 }
 
 /** 超时哨兵: 区分「超时打断」与 executeTask 内部的真实异常 */
@@ -602,6 +612,8 @@ const pendingApprovals = new Map<string, {
 const pendingQuestions = new Map<string, PendingQuestion>()
 /** 提问 provider 是否由本插件持有(false = web GUI 占槽, 提问路由到 GUI) */
 let questionsProviderOurs = false
+/** 会话级模型覆盖(sessionId → {provider?, model}): session_set_model 记录, resume 时同样生效 */
+const sessionModelOverrides = new Map<string, { provider?: string; model: string }>()
 
 /** 从审批请求的会话事件里取审计 id(倒查最近一条匹配 callId 的 approval/asked, 与 web GUI 应答者同款); 找不到时合成兜底 id */
 function approvalPromptIdOf(req: { agent: { session: unknown }; toolName: string; callId?: string }): string {
@@ -750,6 +762,21 @@ async function executeTask(
           const texts: string[] = []
           extractText(ev.data ?? ev, texts)
           if (texts.length) result.toolResults.push(texts.join('\n').slice(0, 3000))
+        }
+      }
+      // 【1】模型/执行失败感知: turn/end reason.kind==='failed' → 结构化错误
+      // (LLM 错误码原样保留——配额/网络/非法参数; 'UNKNOWN' 视为通用执行失败; 超时由 timeout 标记区分)
+      for (const e of log) {
+        const ev = e as { type?: string; data?: { reason?: { kind?: string; error?: { code?: string; message?: string } } } }
+        if (ev.type === 'turn/end' && ev.data?.reason?.kind === 'failed') {
+          const err = ev.data.reason.error
+          const code = err?.code ?? 'UNKNOWN'
+          result.error = {
+            errorCode: code,
+            errorMessage: err?.message ?? 'agent turn failed',
+            errorCategory: code === 'UNKNOWN' ? 'execution' : 'model',
+          }
+          break
         }
       }
     } catch (e) {
@@ -1110,7 +1137,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           })
           item.result.taskId = id
           item.sessionId = item.result.sessionId
-          item.status = 'done'
+          if (item.result.error) {
+            // 模型/执行失败: 任务以 error 结束, client 不再误判成功
+            item.error = `${item.result.error.errorCode}: ${item.result.error.errorMessage}`
+            item.status = 'error'
+          } else {
+            item.status = 'done'
+          }
           return item.result
         } catch (e) {
           item.error = String(e)
@@ -1131,6 +1164,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           }),
         ])
         if (!result) return err(JSON.stringify({ error: `task failed: ${item.error ?? 'unknown'}` }))
+        // 模型/执行失败: 同步路径也以 isError 返回, 附结构化 error + 部分输出供续接
+        if (result.error) {
+          return err(JSON.stringify({ error: result.error, taskId: id, sessionId: result.sessionId, partial: truncateResult(result) }, null, 2))
+        }
         return out(JSON.stringify(truncateResult(result), null, 2))
       } catch (e) {
         if (e !== TASK_TIMEOUT) throw e
@@ -1212,7 +1249,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           })
           item.result.taskId = id
           item.sessionId = item.result.sessionId // 回填实际使用的会话, 供 task_list 附上下文占用/后续续接
-          item.status = 'done'
+          if (item.result.error) {
+            // 模型/执行失败: 任务以 error 结束, client 不再误判成功
+            item.error = `${item.result.error.errorCode}: ${item.result.error.errorMessage}`
+            item.status = 'error'
+          } else {
+            item.status = 'done'
+          }
         } catch (e) {
           item.error = String(e)
           item.status = 'error'
@@ -1577,6 +1620,84 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
+  // 切换会话模型: 改 agent.options.model(agent-loop 每轮 buildRequest 实时读取), 下个 turn 生效;
+  // 持久化会话临时 resume 并记录会话级覆盖, 后续 resume 同样生效
+  mcp.tool(
+    'session_set_model',
+    '给指定会话切换模型(改 agent.options.model, 下一个 turn 生效, 不打断当前执行)。池/live 直改; 持久化会话临时 resume 并记录覆盖(之后 resume 仍生效)。模型 id 参考 model_list(deepseek-v4-flash/pro、glm-5.3/flash 等)。',
+    {
+      sessionId: z.string().describe('会话 id(池/live/持久化均可)'),
+      model: z.string().describe('目标模型 id'),
+      provider: z.string().optional().describe('目标 provider 路由(缺省保持当前)'),
+    },
+    async ({ sessionId, model, provider }) => {
+      let resolved: ResolvedAgent
+      try {
+        resolved = await getAgent(ctx, '', sessionId)
+      } catch (e) {
+        return err(JSON.stringify({ error: (e as Error)?.message ?? String(e) }))
+      }
+      const agent = resolved.handle.agent
+      const opts = (agent as unknown as { options?: { provider?: string; model?: string } }).options
+      const old = { provider: opts?.provider, model: opts?.model }
+      if (opts) {
+        if (provider !== undefined) opts.provider = provider
+        opts.model = model
+      }
+      sessionModelOverrides.set(sessionId, { provider: provider ?? old.provider, model })
+      if (resolved.disposeAfter) {
+        try { await (ctx.get('sessions') as { flush?: (s: unknown) => Promise<unknown> } | undefined)?.flush?.(agent.session) } catch { /* ignore */ }
+        try { await resolved.handle.dispose() } catch { /* ignore */ }
+      }
+      return out(JSON.stringify({
+        ok: true, sessionId,
+        oldModel: old.model ?? '(unset)', newModel: model,
+        oldProvider: old.provider ?? '(unset)', newProvider: provider ?? old.provider ?? '(unset)',
+        note: 'takes effect from the next turn; recorded as session override for future resumes',
+      }, null, 2))
+    },
+  )
+
+  // 向运行中会话插入补充指令(steering): 走 DSH agent.inbox(append, 持久化), 下个 turn/step 边界读取, 不打断当前工具
+  mcp.tool(
+    'session_inject',
+    '向指定会话的 agent 队列插入一条补充指令/上下文(steering 消息): 下个 turn 边界处理, 不打断当前正在执行的工具(参考 DSH agent.inbox / agent/inbox/spliced)。正在执行的任务会在下一步读到; 空闲会话的消息排队等待下个任务。',
+    {
+      sessionId: z.string().describe('会话 id(池/live/持久化均可)'),
+      message: z.string().describe('要插入的补充指令/上下文文本'),
+      target: z.enum(['next-turn', 'next-step']).optional().describe('插入位置(默认 next-turn = 队尾)'),
+    },
+    async ({ sessionId, message, target }) => {
+      let resolved: ResolvedAgent
+      try {
+        resolved = await getAgent(ctx, '', sessionId)
+      } catch (e) {
+        return err(JSON.stringify({ error: (e as Error)?.message ?? String(e) }))
+      }
+      const agent = resolved.handle.agent
+      const inbox = (agent as unknown as { inbox?: { append?: (t: 'next-turn' | 'next-step', m: unknown) => void } }).inbox
+      if (!inbox?.append) {
+        if (resolved.disposeAfter) { try { await resolved.handle.dispose() } catch { /* ignore */ } }
+        return err(JSON.stringify({ error: 'agent inbox unavailable' }))
+      }
+      try {
+        const msg = createUserMessage({ content: [{ type: 'text', text: message }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } })
+        inbox.append(target ?? 'next-turn', msg as never)
+      } catch (e) {
+        if (resolved.disposeAfter) { try { await resolved.handle.dispose() } catch { /* ignore */ } }
+        return err(JSON.stringify({ error: `inject failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+      if (resolved.disposeAfter) {
+        try { await (ctx.get('sessions') as { flush?: (s: unknown) => Promise<unknown> } | undefined)?.flush?.(agent.session) } catch { /* ignore */ }
+        try { await resolved.handle.dispose() } catch { /* ignore */ }
+      }
+      return out(JSON.stringify({
+        ok: true, sessionId, target: target ?? 'next-turn',
+        note: 'queued; processed at the next turn/step boundary without interrupting the current tool',
+      }, null, 2))
+    },
+  )
+
   // 手动归组补给站: 官方 UI 没有"移动会话到工作区"功能, 本工具供随时归组
   mcp.tool(
     'attach_session',
@@ -1640,7 +1761,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   // approve → 'allowed-once'(一次性授权), deny → 'rejected', 任务取消/超时 → signal abort → 'cancelled'。
   const onApprovalRequest = (req: ApprovalRequestView, next: () => Promise<string>): Promise<string> => {
     if (req.signal?.aborted) return Promise.resolve('cancelled')
-    const agentId = String(req.agent.id)
+    // 防御: agent.id 为权威; 个别实现只挂 session.id 时兜底
+    const agentId = String(req.agent.id ?? (req.agent.session as { id?: unknown } | undefined)?.id)
     if (!mcpSessionIds.has(agentId)) return next()
     const promptId = approvalPromptIdOf(req)
     return new Promise<string>((resolve) => {
@@ -1802,6 +1924,12 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       agentLocks.clear()
       taskQueue.clear()
       taskCancelHooks.clear()
+      mcpSessionIds.clear()
+      sessionModelOverrides.clear()
+      for (const pa of pendingApprovals.values()) pa.resolve('cancelled')
+      pendingApprovals.clear()
+      for (const pq of pendingQuestions.values()) pq.reject(new Error('harness-mcp-server unloaded'))
+      pendingQuestions.clear()
     }
   }, 'harness-mcp-server')
 }
