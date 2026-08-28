@@ -28,7 +28,7 @@ Harness agent (flash) — full toolset: bash, fs, todo, web…
 | `echo` | — | Verify MCP connectivity |
 | `harness_list_tools` | — | List Harness's registered tool names |
 | `harness_status` | Hermes ← Harness | Operations overview: queue / agent pool / live agents / runtime config |
-| `model_list` | Hermes ← Harness | List a provider's model catalog to pick a model per task |
+| `model_list` | Hermes ← Harness | List every registered provider's models (plus declared-but-inactive providers); `withWindow` adds context windows |
 | `workspace_list` | Hermes ← Harness | List workspaces and their session groups |
 | `agent_run` | Hermes → Harness | Run a task synchronously and return a structured result (pass `timeoutMs` to auto-convert long tasks to async) |
 | `task_inbox` | Hermes → Harness | Push a structured task (task + memory context + cwd) to an async queue (`timeoutMs` per-task override) |

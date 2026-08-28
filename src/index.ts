@@ -70,7 +70,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = '0.8.0'
+export const VERSION = '0.9.0'
 
 /**
  * 声明依赖的核心服务。
@@ -801,25 +801,59 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
-  // 模型目录: 供外部按任务挑选模型(llm.listModels; 窗口信息在会话上下文里按需解析)
+  // 模型目录: 缺省枚举所有已注册 provider 的模型(listProviders), 并补上已声明但未激活的配置 provider;
+  // 传 provider 只列该 provider; withWindow=true 时逐模型解析上下文窗口(多一次 llm 查询)
   mcp.tool(
     'model_list',
-    '列出指定 provider 的可用模型目录(ctx.llm.listModels), 供外部按任务选模型。',
+    '列出可用模型目录: 缺省枚举所有已注册 provider 的模型(listProviders), 并补上已声明但未激活的配置 provider(active:false); 传 provider 只列该 provider; withWindow=true 时逐模型解析 contextWindow(可能较慢)。',
     {
-      provider: z.string().optional().describe('provider 路由(默认 deepseek-official)'),
+      provider: z.string().optional().describe('只列出该 provider 路由的模型(缺省: 全部已注册 provider)'),
+      withWindow: z.boolean().optional().describe('true = 逐模型解析 contextWindow'),
     },
-    async ({ provider }) => {
-      const llm = ctx.get('llm') as { listModels?: (p: string) => Promise<{ id: string; name?: string; description?: string; inputModalities?: readonly string[] }[]> } | undefined
-      try {
-        const models = (await llm?.listModels?.(provider ?? runtimeConfig.provider)) ?? []
-        return out(JSON.stringify({
-          provider: provider ?? runtimeConfig.provider,
-          total: models.length,
-          models: models.map((m) => ({ id: m.id, name: m.name, description: m.description, inputModalities: m.inputModalities })),
-        }, null, 2))
-      } catch (e) {
-        return err(JSON.stringify({ error: `listModels failed: ${(e as Error)?.message ?? String(e)}` }))
+    async ({ provider, withWindow }) => {
+      const llm = ctx.get('llm') as {
+        listProviders?: () => { id: string; name?: string }[]
+        listModels?: (p: string) => Promise<{ id: string; name?: string; description?: string; inputModalities?: readonly string[] }[]>
+        listConfigurableProviders?: () => { provider: string; displayName?: string; declared?: boolean }[]
+      } | undefined
+      if (!llm?.listProviders) return err(JSON.stringify({ error: 'llm service unavailable' }))
+      const registered = llm.listProviders?.() ?? []
+      const directory = llm.listConfigurableProviders?.() ?? []
+
+      const rows: Record<string, unknown>[] = []
+      const seen = new Set<string>()
+      // 指定 provider 时只列它(未注册 → 报错行); 否则遍历全部已注册路由
+      const targets = provider ? [{ id: provider, name: provider }] : registered
+      for (const p of targets) {
+        seen.add(p.id)
+        try {
+          const models = (await llm.listModels?.(p.id)) ?? []
+          const listed = await Promise.all(models.map(async (m) => {
+            const row: Record<string, unknown> = { id: m.id, name: m.name, description: m.description, inputModalities: m.inputModalities }
+            if (withWindow) row.contextWindow = await modelWindowOf(ctx, p.id, m.id)
+            return row
+          }))
+          rows.push({ provider: p.id, providerName: p.name, active: true, total: listed.length, models: listed })
+        } catch (e) {
+          rows.push({ provider: p.id, providerName: p.name, active: true, error: (e as Error)?.message ?? String(e) })
+        }
       }
+      // 补全目录(仅在枚举全部时): 已声明但未注册(未激活/未配置)的 provider 也列出, 客户端可见"全部可能配置"
+      if (!provider) {
+        for (const cp of directory) {
+          if (seen.has(cp.provider)) continue
+          seen.add(cp.provider)
+          rows.push({
+            provider: cp.provider,
+            providerName: cp.displayName,
+            active: false,
+            total: 0,
+            models: [],
+            note: 'declared but not active (configure the provider to activate)',
+          })
+        }
+      }
+      return out(JSON.stringify({ total: rows.length, providers: rows }, null, 2))
     },
   )
 

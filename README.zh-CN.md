@@ -30,7 +30,7 @@ Harness agent (flash) — 完整工具集: bash、fs、todo、web…
 | `echo` | — | 验证 MCP 连通性 |
 | `harness_list_tools` | — | 列出 Harness 已注册的工具名 |
 | `harness_status` | Hermes ← Harness | 运维总览：队列 / agent 池 / live 会话 / 运行时配置 |
-| `model_list` | Hermes ← Harness | 列出 provider 的模型目录，供按任务选模型 |
+| `model_list` | Hermes ← Harness | 列出所有已注册 provider 的模型（含已声明未激活的 provider）；`withWindow` 附加上下文窗口 |
 | `workspace_list` | Hermes ← Harness | 列出工作区及其会话分组 |
 | `agent_run` | Hermes → Harness | 同步执行任务，返回结构化结果（传 `timeoutMs` 可把长任务自动转异步） |
 | `task_inbox` | Hermes → Harness | 把结构化任务（任务 + 记忆上下文 + cwd）推入异步队列（支持 per-task `timeoutMs`） |

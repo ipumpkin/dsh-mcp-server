@@ -78,10 +78,17 @@ const fakeMeter = {
 }
 const fakeLlm = {
   resolveModel: async () => ({ id: 'deepseek-v4-flash', context: { contextWindow: 200 } }),
-  listModels: async () => [
-    { id: 'deepseek-v4-flash', name: 'Flash', description: 'fast' },
-    { id: 'deepseek-v4-pro', name: 'Pro', description: 'big' },
+  listProviders: () => [
+    { id: 'deepseek-official', name: 'DeepSeek' },
+    { id: 'zai', name: 'ZAI' },
   ],
+  listConfigurableProviders: () => [
+    { provider: 'zai', displayName: 'ZAI' },
+    { provider: 'custom-gw', displayName: 'Custom Gateway' },
+  ],
+  listModels: async (p) => (p === 'zai'
+    ? [{ id: 'glm-5.3', name: 'GLM-5.3' }, { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash' }]
+    : [{ id: 'deepseek-v4-flash', name: 'Flash', description: 'fast' }, { id: 'deepseek-v4-pro', name: 'Pro', description: 'big' }]),
 }
 const compactCalls = []
 const fakeCompaction = {
@@ -331,8 +338,21 @@ try {
 
   const models = await call(init.sid, 'model_list', {})
   const modelsInner = innerOf(models)
-  checks['model_list: 列出模型目录'] = Array.isArray(modelsInner.models)
-    && modelsInner.models.some((m) => m.id === 'deepseek-v4-flash') && modelsInner.total === 2
+  checks['model_list: 列出所有 provider 的模型'] = Array.isArray(modelsInner.providers)
+    && modelsInner.providers.some((r) => r.provider === 'deepseek-official' && r.active === true
+      && r.models.some((m) => m.id === 'deepseek-v4-flash'))
+  checks['model_list: 含 zai 配置模型'] = modelsInner.providers.some((r) => r.provider === 'zai'
+    && r.models.some((m) => m.id === 'glm-5.3'))
+  checks['model_list: 目录补全未激活 provider'] = modelsInner.providers.some((r) => r.provider === 'custom-gw' && r.active === false)
+
+  const modelsZai = await call(init.sid, 'model_list', { provider: 'zai' })
+  const modelsZaiInner = innerOf(modelsZai)
+  checks['model_list: 指定 provider 只列该 provider'] = modelsZaiInner.providers.length === 1
+    && modelsZaiInner.providers[0].provider === 'zai' && modelsZaiInner.providers[0].models.length === 2
+
+  const modelsWin = await call(init.sid, 'model_list', { withWindow: true })
+  const winRow = innerOf(modelsWin).providers.find((r) => r.provider === 'deepseek-official')
+  checks['model_list: withWindow 解析上下文窗口'] = winRow?.models.every((m) => m.contextWindow === 200)
 
   // ── 增量9: 客户端契约(缺 cwd / 超时转异步 / task_wait) ──
   const noCwd = await call(init.sid, 'agent_run', { task: 'no cwd' })
