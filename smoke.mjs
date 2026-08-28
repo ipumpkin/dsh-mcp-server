@@ -90,6 +90,10 @@ const fakeLlm = {
     ? [{ id: 'glm-5.3', name: 'GLM-5.3' }, { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash' }]
     : [{ id: 'deepseek-v4-flash', name: 'Flash', description: 'fast' }, { id: 'deepseek-v4-pro', name: 'Pro', description: 'big' }]),
 }
+// agentDefaultModel 默认选择: 供未显式指定 model 时兜底(persona {{model}} 变量需要)
+const fakeDefaultModel = {
+  currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-v4-default' }),
+}
 const compactCalls = []
 const fakeCompaction = {
   compactNow: async (agentCtx) => {
@@ -138,6 +142,7 @@ const ctx = {
     : name === 'sessionPersistence' ? fakePersistence
     : name === 'tokenMeter' ? fakeMeter
     : name === 'llm' ? fakeLlm
+    : name === 'agentDefaultModel' ? fakeDefaultModel
     : name === 'compaction' ? fakeCompaction
     : undefined),
 }
@@ -326,6 +331,28 @@ try {
   const readUnknown = await call(init.sid, 'session_read', { sessionId: 'sess-unknown' })
   checks['session_read: 未知会话报错'] = String(innerOf(readUnknown).error ?? '').includes('session not found')
 
+  // 回归: 真实 dsh 日志里 chunk/内部事件占绝大多数, limit 必须按「表面事件」计而非原始日志条数
+  {
+    const fakeLog = []
+    for (let i = 0; i < 60; i++) {
+      fakeLog.push({ seq: fakeLog.length, type: 'assistant/chunk', data: { chunk: 'x' } })
+      fakeLog.push({ seq: fakeLog.length, type: 'step/start' })
+      if (i % 10 === 0) fakeLog.push({ seq: fakeLog.length, type: 'user/message', data: { message: { content: [{ type: 'text', text: `msg-${i}` }] } } })
+      if (i % 5 === 0) fakeLog.push({ seq: fakeLog.length, type: 'tool/call', data: { name: 'bash', arguments: `echo ${i}` } })
+      if (i % 5 === 0) fakeLog.push({ seq: fakeLog.length, type: 'tool/result', data: { content: [{ type: 'text', text: `out-${i}` }] } })
+      fakeLog.push({ seq: fakeLog.length, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: `asst-${i}` }] } } })
+      fakeLog.push({ seq: fakeLog.length, type: 'step/end' })
+    }
+    liveAgent.session.log = fakeLog
+    const read50 = await call(init.sid, 'session_read', { sessionId: 'sess-live', limit: 50 })
+    const r = innerOf(read50)
+    checks['session_read: limit 按表面事件计(chunk 不占额)'] = r.returned === 50 && r.total === 90 && r.logEvents > r.total
+    checks['session_read: 返回按时间序的最近表面事件'] = r.events[49]?.text === 'asst-59'
+    const readAll = await call(init.sid, 'session_read', { sessionId: 'sess-live' })
+    checks['session_read: 缺省 limit=100 返回全部表面事件'] = innerOf(readAll).returned === 90
+    liveAgent.session.log = []
+  }
+
   const ws = await call(init.sid, 'workspace_list', {})
   const wsInner = innerOf(ws)
   checks['workspace_list: 列出工作区'] = Array.isArray(wsInner.workspaces)
@@ -365,6 +392,9 @@ try {
 
   const convCancel = await call(init.sid, 'task_cancel', { taskId: convInner.taskId })
   checks['agent_run 转异步后可 task_cancel 取消'] = innerOf(convCancel).cancelled === true
+  // persona {{model}} 兜底: 未显式传 model 时, create 也必须收到解析后的默认模型
+  checks['agent_run 缺省 model: 从 agentDefaultModel 兜底填充'] = created[5]?.options?.model === 'deepseek-v4-default'
+    && created[5]?.options?.provider === 'deepseek-official'
 
   let convDone
   for (let i = 0; i < 40; i++) {

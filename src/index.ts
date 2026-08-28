@@ -70,7 +70,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = '0.9.0'
+export const VERSION = '0.9.1'
 
 /**
  * 声明依赖的核心服务。
@@ -206,12 +206,9 @@ async function getAgent(
   fresh?: boolean,
   modelOpts?: { provider?: string; model?: string },
 ): Promise<ResolvedAgent> {
-  const effectiveModel = modelOpts?.model ?? runtimeConfig.model
-  const agentOptions = {
-    provider: modelOpts?.provider ?? runtimeConfig.provider,
-    // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
-    ...(effectiveModel ? { model: effectiveModel } : {}),
-  }
+  // 恒解析生效模型(显式覆盖 → 插件配置 → agentDefaultModel): 预设 persona 引用 {{model}},
+  // agent.options.model 缺失会让 prompt 组装抛 "has no value for this assembly" 并空跑本轮。
+  const agentOptions = resolveAgentModel(ctx, modelOpts)
   // 指定 sessionId: 接管已有会话(长任务分多轮投喂 / 中断后恢复 / UI 手开的会话)
   if (sessionId) {
     // 先看本进程常驻池(指定 sessionId 时定位到对应 cwd 的常驻会话; 命中 LRU 移到末尾, 保留上游语义)
@@ -221,6 +218,7 @@ async function getAgent(
       if (existing) {
         liveAgents.delete(targetCwd)
         liveAgents.set(targetCwd, existing)
+        mcpSessionIds.add(sessionId)
         return existing
       }
     }
@@ -230,6 +228,7 @@ async function getAgent(
     if (live) {
       // live 会话也补挂工作区(幂等): 用户手开的会话若尚未归组, 这里一并挂名
       await attachSessionCwd(ctx, sid, live.session.header.cwd)
+      mcpSessionIds.add(sessionId) // 被 MCP 接管即视为 MCP 驱动(审批转达调用方)
       // no-op dispose 兜底: executeTask 只在 disposeAfter 为 true 时调用 dispose
       return { sessionId: sid, handle: { agent: live, dispose: () => Promise.resolve() }, disposeAfter: false }
     }
@@ -254,6 +253,7 @@ async function getAgent(
       throw new Error(`session not found for resume: ${sessionId} (not live and not persisted; ${(e as Error)?.message ?? e})`)
     }
     await attachSessionCwd(ctx, sid, handle.agent.session.header.cwd)
+    mcpSessionIds.add(sessionId)
     return { sessionId: sid, handle, disposeAfter: true }
   }
   // 显式全新会话: 跳过池命中 —— 先退役该 cwd 的旧池会话(保留持久化, 可凭 sessionId 续接)。
@@ -325,6 +325,7 @@ async function createPoolAgent(ctx: Context, cwd: string, title?: string, agentO
   const rec = { sessionId: newSessionId, handle }
   liveAgents.set(cwd, rec)
   sessionToCwd.set(String(newSessionId), cwd)
+  mcpSessionIds.add(String(newSessionId))
 
   // 分组: 把会话归属到 cwd 对应的工作区(resolveByPath ?? create + attachSession; 可选依赖; headless 环境自动跳过)
   void (async () => {
@@ -507,6 +508,28 @@ function taskProgressOf(ctx: Context, item: TaskItem): Record<string, unknown> {
   info.toolCalls = toolCalls
   if (currentTool) info.currentTool = currentTool
   if (lastText) info.lastText = lastText
+
+  // 等待输入感知: 审批(本插件应答链挂起)与提问(本插件 provider 挂起 / GUI 路由的挂起 ask_user_question)
+  // → status=waiting_input + prompts[], 供 MCP 调用方感知弹窗并响应(prompt_respond / web GUI)
+  const prompts: Record<string, unknown>[] = []
+  for (const pa of pendingApprovals.values()) {
+    if (pa.agentId === item.sessionId) {
+      prompts.push({ type: 'approval', id: pa.promptId, toolName: pa.toolName, ...(pa.reason !== undefined ? { reason: pa.reason } : {}) })
+    }
+  }
+  for (const pq of pendingQuestions.values()) {
+    if (pq.agentId === item.sessionId) prompts.push({ type: 'question', id: pq.promptId, questions: pq.questions })
+  }
+  if (!questionsProviderOurs) {
+    const detected = detectPendingAskUser(session)
+    if (detected) {
+      prompts.push({ type: 'question', id: detected.id, questions: detected.questions, note: 'routed to the web GUI provider; answer in the DSH web UI' })
+    }
+  }
+  if (prompts.length > 0) {
+    info.status = 'waiting_input'
+    info.prompts = prompts
+  }
   return info
 }
 
@@ -528,6 +551,99 @@ function cwdAllowed(workdir: string): boolean {
     const r = resolve(root)
     return workdir === r || workdir.startsWith(r + '/')
   })
+}
+
+/** 解析 agent 生效的 provider/model: 显式覆盖 → 插件配置 → agentDefaultModel 默认选择。
+ *  必须恒有 model: 预设 persona 模板(如 standard 的 "powered by the {{model}} model")引用 {{model}} 变量,
+ *  该变量取自 agent.options.model —— 缺失时 prompt 组装抛
+ *  `prompt variable "{{model}}" has no value for this assembly (section "deployment:persona")`, 本轮空跑。 */
+function resolveAgentModel(ctx: Context, modelOpts?: { provider?: string; model?: string }): { provider: string; model?: string } {
+  const explicit = modelOpts?.model ?? runtimeConfig.model
+  if (explicit) return { provider: modelOpts?.provider ?? runtimeConfig.provider, model: explicit }
+  const def = (ctx.get('agentDefaultModel') as { currentSelection?: () => { provider?: string; model?: string } } | undefined)?.currentSelection?.()
+  const provider = modelOpts?.provider ?? def?.provider ?? runtimeConfig.provider
+  const model = def?.model
+  if (!model) {
+    console.warn('[harness-mcp-server] no model resolved (agentDefaultModel service missing?); persona {{model}} may fail to assemble')
+  }
+  return { provider, model }
+}
+
+/** 待响应的提问 prompt(仅当本插件持有 user-questions provider 时产生; web GUI 占槽时提问走 GUI) */
+interface PendingQuestion {
+  promptId: string
+  agentId: string
+  questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }>
+  resolve: (answer: { answers: Array<{ id: string; selected: string[]; custom?: string }> }) => void
+  reject: (e: Error) => void
+}
+
+/** MCP 驱动的会话 id 集(创建/接管即标记): 审批应答者只认领这些会话的审批, 其余交给 web GUI 应答链 */
+const mcpSessionIds = new Set<string>()
+/** 审批决策结果(DSH 词汇表的调用方可控子集; 'unavailable' 仅由 fail-closed 产生) */
+type ApprovalOutcomeValue = 'allowed-once' | 'rejected' | 'cancelled'
+/** ctx.approval 'approval/request' 请求的只读视图(鸭子类型, 避免引入 dsh-user-approval 依赖) */
+interface ApprovalRequestView {
+  agent: { id: unknown; session: unknown }
+  toolName: string
+  callId?: string
+  reason?: string
+  signal?: AbortSignal
+}
+/** 待响应的审批 prompt(promptId = 审计事件 approval/asked 的 id) */
+const pendingApprovals = new Map<string, {
+  promptId: string
+  agentId: string
+  toolName: string
+  reason?: string
+  resolve: (outcome: ApprovalOutcomeValue) => void
+}>()
+/** 待响应的提问 prompt */
+const pendingQuestions = new Map<string, PendingQuestion>()
+/** 提问 provider 是否由本插件持有(false = web GUI 占槽, 提问路由到 GUI) */
+let questionsProviderOurs = false
+
+/** 从审批请求的会话事件里取审计 id(倒查最近一条匹配 callId 的 approval/asked, 与 web GUI 应答者同款); 找不到时合成兜底 id */
+function approvalPromptIdOf(req: { agent: { session: unknown }; toolName: string; callId?: string }): string {
+  const events = ((req.agent.session as unknown as { events?: Array<{ type?: string; data?: { id?: string; callId?: string } }> }).events ?? [])
+  const decided = new Set<string>()
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]
+    if (e?.type === 'approval/decided') decided.add(e.data?.id as string)
+    else if (e?.type === 'approval/asked') {
+      if (decided.has(e.data?.id as string)) continue
+      if ((req.callId ?? null) !== (e.data?.callId ?? null)) continue
+      if (e.data?.id) return String(e.data.id)
+    }
+  }
+  return `approval-${req.toolName}-${Date.now()}`
+}
+
+/** 检测挂起的 ask_user_question 工具调用(web GUI 持有提问 provider 时, 这是感知提问的唯一途径):
+ *  倒查最后一条 ask_user_question 的 tool/call, 其后没有 tool/result 即为挂起。 */
+function detectPendingAskUser(session: unknown): { id: string; questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }> } | undefined {
+  const log = (session as { log?: unknown[] }).log ?? []
+  let callIdx = -1
+  for (let i = log.length - 1; i >= 0; i--) {
+    const e = log[i] as { type?: string; data?: { name?: string } }
+    if (e.type === 'tool/call' && e.data?.name === 'ask_user_question') { callIdx = i; break }
+  }
+  if (callIdx < 0) return undefined
+  for (let i = callIdx + 1; i < log.length; i++) {
+    if ((log[i] as { type?: string }).type === 'tool/result') return undefined
+  }
+  const args = (log[callIdx] as { data?: { arguments?: string } }).data?.arguments
+  let questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }> = []
+  try {
+    const parsed = JSON.parse(args ?? '{}') as { questions?: Array<{ id?: string; question?: string; detail?: string; options?: { label?: string }[] }> }
+    questions = (parsed.questions ?? []).map((q) => ({
+      id: String(q.id ?? ''),
+      question: String(q.question ?? ''),
+      ...(q.detail !== undefined ? { detail: q.detail } : {}),
+      ...(q.options !== undefined ? { options: (q.options ?? []).map((o) => ({ label: o.label ?? '' })) } : {}),
+    }))
+  } catch { /* 参数不可解析时仅报挂起, 不带原文 */ }
+  return { id: `ask-${callIdx}`, questions }
 }
 
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
@@ -892,8 +1008,20 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       const agent = resolved.handle.agent
       try {
         const log = ((agent.session as unknown as { log?: unknown[] }).log ?? [])
+        // limit 按「表面事件」计: 真实 dsh 日志里 assistant/chunk、reasoning-chunks、step/* 等流式/内部事件
+        // 占绝对多数且稀疏夹杂表面事件, 直接 slice 原始日志会让 limit 失效(最后 N 条原始日志常只含 1 条表面事件)。
+        // 因此先收集表面事件下标, 再取最近 N 条格式化。
+        const surfaceTypes = new Set(['user/message', 'assistant/message', 'tool/call', 'tool/result'])
+        const max = limit ?? 100
+        const surfaceIdx: number[] = []
+        for (let i = 0; i < log.length; i++) {
+          const t = (log[i] as { type?: string })?.type
+          if (t !== undefined && surfaceTypes.has(t)) surfaceIdx.push(i)
+        }
+        const start = Math.max(0, surfaceIdx.length - max)
         const events: { seq?: number; type?: string; text?: string }[] = []
-        for (const ev of log.slice(-(limit ?? 100))) {
+        for (let k = start; k < surfaceIdx.length; k++) {
+          const ev = log[surfaceIdx[k] as number]
           const e = ev as { seq?: number; type?: string; data?: { message?: { content?: { type?: string; text?: string }[] }; name?: string; arguments?: string } }
           const type = e.type
           if (type === 'user/message' || type === 'assistant/message') {
@@ -908,7 +1036,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             events.push({ seq: e.seq, type, text: texts.join('\n').slice(0, 3000) || '(empty result)' })
           }
         }
-        return out(JSON.stringify({ sessionId, total: log.length, returned: events.length, events }, null, 2))
+        return out(JSON.stringify({ sessionId, total: surfaceIdx.length, logEvents: log.length, returned: events.length, events }, null, 2))
       } finally {
         if (resolved.disposeAfter) {
           try { await (ctx.get('sessions') as { flush?: (s: unknown) => Promise<unknown> } | undefined)?.flush?.(agent.session) } catch { /* ignore */ }
@@ -1379,6 +1507,76 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
+  // 感知: 列出等待输入的弹窗(审批/提问)。审批一律转达调用方, 用 prompt_respond 响应; 未响应前任务挂起。
+  mcp.tool(
+    'pending_prompts',
+    '列出当前等待输入的弹窗(审批/提问)。审批=权限审批待决策(approve/deny); 提问=agent 的澄清问题(自由文本回答)。可用 prompt_respond 响应; 未响应前任务保持挂起。',
+    {
+      sessionId: z.string().optional().describe('只列出该会话的弹窗(缺省: 全部 MCP 会话)'),
+    },
+    async ({ sessionId }) => {
+      const prompts: Record<string, unknown>[] = []
+      for (const pa of pendingApprovals.values()) {
+        if (!sessionId || pa.agentId === sessionId) {
+          prompts.push({ sessionId: pa.agentId, type: 'approval', id: pa.promptId, toolName: pa.toolName, ...(pa.reason !== undefined ? { reason: pa.reason } : {}) })
+        }
+      }
+      for (const pq of pendingQuestions.values()) {
+        if (!sessionId || pq.agentId === sessionId) prompts.push({ sessionId: pq.agentId, type: 'question', id: pq.promptId, questions: pq.questions })
+      }
+      // web GUI 持有提问 provider 时, MCP 会话里挂起的 ask_user_question 调用仍可感知(应答在 GUI)
+      if (!questionsProviderOurs) {
+        for (const sid of (sessionId ? [sessionId] : [...mcpSessionIds])) {
+          const agent = liveAgentFor(ctx, sid)
+          const detected = agent !== undefined ? detectPendingAskUser(agent.session) : undefined
+          if (detected) {
+            prompts.push({ sessionId: sid, type: 'question', id: detected.id, questions: detected.questions, note: 'routed to the web GUI provider; answer in the DSH web UI' })
+          }
+        }
+      }
+      return out(JSON.stringify({ total: prompts.length, prompts }, null, 2))
+    },
+  )
+
+  // 响应: 解除等待中的弹窗。审批 approve→allowed-once(一次性授权) / deny→rejected; 提问→自由文本回答。
+  mcp.tool(
+    'prompt_respond',
+    '响应等待中的弹窗: 审批用 decision=approve|deny(approve 为一次性授权, 绝不自动放行——每次审批都必须显式决策); 提问用 answer 自由文本。响应后 agent 解除阻塞继续执行。',
+    {
+      sessionId: z.string().describe('弹窗所属会话 id'),
+      promptId: z.string().describe('pending_prompts / progress 返回的 prompt id'),
+      decision: z.enum(['approve', 'deny']).optional().describe('审批类弹窗的决策(approve=放行一次, deny=拒绝)'),
+      answer: z.string().optional().describe('提问类弹窗的自由文本回答'),
+    },
+    async ({ sessionId, promptId, decision, answer }) => {
+      const pa = pendingApprovals.get(promptId)
+      if (pa !== undefined) {
+        if (pa.agentId !== sessionId) return err(JSON.stringify({ error: `prompt ${promptId} belongs to session ${pa.agentId}, not ${sessionId}` }))
+        if (decision !== 'approve' && decision !== 'deny') {
+          return err(JSON.stringify({ error: 'approval prompts require decision=approve|deny' }))
+        }
+        const outcome = decision === 'approve' ? 'allowed-once' : 'rejected'
+        pa.resolve(outcome)
+        return out(JSON.stringify({ ok: true, promptId, type: 'approval', resolved: outcome }, null, 2))
+      }
+      const pq = pendingQuestions.get(promptId)
+      if (pq !== undefined) {
+        if (pq.agentId !== sessionId) return err(JSON.stringify({ error: `prompt ${promptId} belongs to session ${pq.agentId}, not ${sessionId}` }))
+        if (answer === undefined || answer === '') return err(JSON.stringify({ error: 'question prompts require answer text' }))
+        const answered = pq.questions.map((q) => ({ id: q.id, selected: [], custom: answer }))
+        pq.resolve({ answers: answered })
+        return out(JSON.stringify({ ok: true, promptId, type: 'question', answered: answered.length }, null, 2))
+      }
+      // 未挂起: 若是 GUI 路由的挂起提问则给出明确指引
+      const agent = liveAgentFor(ctx, sessionId)
+      const detected = agent !== undefined ? detectPendingAskUser(agent.session) : undefined
+      if (detected !== undefined && detected.id === promptId && !questionsProviderOurs) {
+        return err(JSON.stringify({ error: 'this question is routed to the web GUI provider; answer it in the DSH web UI (the MCP-side provider slot is owned by the GUI in this deployment)' }))
+      }
+      return err(JSON.stringify({ error: `prompt not found: ${promptId}` }))
+    },
+  )
+
   // 手动归组补给站: 官方 UI 没有"移动会话到工作区"功能, 本工具供随时归组
   mcp.tool(
     'attach_session',
@@ -1436,6 +1634,82 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
   const host = config.host ?? '127.0.0.1'
   console.log('[harness-mcp-server] apply called, port=', port)
+
+  // ── 审批应答者: MCP 会话的审批弹窗一律转达调用方, 绝不自动放行 ──
+  // prepend 抢在 web GUI 应答者之前认领 MCP 会话的审批; 非 MCP 会话 next() 交给 GUI 应答链。
+  // approve → 'allowed-once'(一次性授权), deny → 'rejected', 任务取消/超时 → signal abort → 'cancelled'。
+  const onApprovalRequest = (req: ApprovalRequestView, next: () => Promise<string>): Promise<string> => {
+    if (req.signal?.aborted) return Promise.resolve('cancelled')
+    const agentId = String(req.agent.id)
+    if (!mcpSessionIds.has(agentId)) return next()
+    const promptId = approvalPromptIdOf(req)
+    return new Promise<string>((resolve) => {
+      let settled = false
+      const settle = (outcome: ApprovalOutcomeValue) => {
+        if (settled) return
+        settled = true
+        pendingApprovals.delete(promptId)
+        req.signal?.removeEventListener('abort', onAbort)
+        resolve(outcome)
+      }
+      const onAbort = () => settle('cancelled')
+      pendingApprovals.set(promptId, { promptId, agentId, toolName: req.toolName, reason: req.reason, resolve: settle })
+      req.signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+  ;(ctx.on as unknown as (name: string, listener: unknown, options?: { prepend?: boolean }) => unknown)(
+    'approval/request',
+    onApprovalRequest,
+    { prepend: true },
+  )
+
+  // ── 提问 provider: 单槽能力缝; web GUI 已占用时降级(提问路由到 GUI, MCP 仍可感知但需在 GUI 应答) ──
+  const userQuestions = ctx.get('userQuestions') as {
+    registerProvider?: (p: { ask: (request: unknown) => Promise<unknown> }) => () => void
+  } | undefined
+  if (userQuestions?.registerProvider) {
+    try {
+      userQuestions.registerProvider({
+        ask: (request) => {
+          const r = request as {
+            questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }>
+            agent?: { id: unknown }
+            signal?: AbortSignal
+          }
+          const promptId = `q-${randomUUID()}`
+          return new Promise((resolve, reject) => {
+            let settled = false
+            const settle = (fn: () => void) => {
+              if (settled) return
+              settled = true
+              pendingQuestions.delete(promptId)
+              r.signal?.removeEventListener('abort', onAbort)
+              fn()
+            }
+            const onAbort = () => settle(() => reject(new Error('ask_user_question was aborted before the user answered')))
+            pendingQuestions.set(promptId, {
+              promptId,
+              agentId: r.agent !== undefined ? String(r.agent.id) : '(host)',
+              questions: r.questions.map((q) => ({
+                id: q.id,
+                question: q.question,
+                ...(q.detail !== undefined ? { detail: q.detail } : {}),
+                ...(q.options !== undefined ? { options: (q.options ?? []).map((o) => ({ label: o.label })) } : {}),
+              })),
+              resolve: (answer) => settle(() => resolve(answer)),
+              reject: (e) => settle(() => reject(e)),
+            })
+            r.signal?.addEventListener('abort', onAbort, { once: true })
+          })
+        },
+      })
+      questionsProviderOurs = true
+      console.log('[harness-mcp-server] user-questions provider registered (question prompts answerable via prompt_respond)')
+    } catch {
+      questionsProviderOurs = false
+      console.warn('[harness-mcp-server] user-questions provider already registered (web GUI); question prompts route to the GUI and remain visible via progress/pending_prompts')
+    }
+  }
 
   const servers = new Map<string, McpServer>()
   const transports = new Map<string, StreamableHTTPServerTransport>()
