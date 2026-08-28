@@ -74,7 +74,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = '0.9.3'
+export const VERSION = '0.9.4'
 
 /**
  * 声明依赖的核心服务。
