@@ -61,7 +61,7 @@ import type {} from '@deepseek-ai/dsh-agent-presets'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
@@ -76,7 +76,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.9.5"
+export const VERSION = "0.9.6"
 
 /**
  * 声明依赖的核心服务。
@@ -684,19 +684,68 @@ function detectPendingAskUser(session: unknown): { id: string; questions: Array<
   return { id: `ask-${callIdx}`, questions }
 }
 
-/** 向会话追加一条 UI 可见的 notice 消息: form:'notice' 的 plugin 来源 user/message,
- *  web UI 以折叠提示行专属呈现(与 dsh-plan-mode/dsh-tool-goal 等官方插件同款机制)。
- *  让用户打开 web 会话界面即可看到「该审批/提问已被 MCP 侧接管处理中」的提示。 */
-function appendPromptNotice(session: unknown, text: string, summary: string): void {
-  try {
-    const s = session as { append?: (type: 'user/message', data: unknown, opts?: { surfaceOp?: string }) => unknown }
-    s.append?.('user/message', createUserMessage({
-      content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'harness-mcp-server', form: 'notice' as const, summary },
-    }), { surfaceOp: 'append' })
-  } catch (e) {
-    console.warn('[harness-mcp-server] prompt notice append failed:', (e as Error)?.message ?? e)
+/** 待安全落点的 notice(审批/提问被 MCP 接管/响应时产生), 由 tools/post-execute 在工具完成后统一投递 */
+interface PendingNotice {
+  text: string
+  summary: string
+}
+
+/**
+ * 按 agent id 挂起的 notice 队列: 拦截时只入队, 绝不直接写会话日志。
+ * 修复回归: 旧版 appendPromptNotice 在 approval/request 拦截期直接 append user/message,
+ * 若时机落在 assistant 带 tool_calls 的消息与其 tool/result 之间, 会打断消息序列,
+ * 使下个模型请求报 'An assistant message with tool_calls must be followed by tool
+ * messages responding to each tool_call_id'(INVALID_REQUEST), 会话失效。
+ */
+const pendingNotices = new Map<string, PendingNotice[]>()
+
+/** 从 agent 鸭子类型取稳定 id(与 mcpSessionIds / 审批应答者同款身份解析) */
+function agentIdOf(agent: unknown): string | undefined {
+  const a = agent as { id?: unknown; session?: { id?: unknown } } | undefined
+  if (a === undefined) return undefined
+  const id = a.id ?? a.session?.id
+  return id === undefined ? undefined : String(id)
+}
+
+/** 构造一条 form:'notice' 的 plugin 来源 user/message(web UI 折叠提示行专属呈现, 与官方插件同款) */
+function noticeUserMessage(text: string, summary: string) {
+  return createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'plugin',
+      plugin: 'harness-mcp-server',
+      form: 'notice' as const,
+      summary: boundContextSummary(summary),
+    },
+  })
+}
+
+/** 【2】web UI 提示(安全落点版): 审批/提问被 MCP 拦截/响应时只把提示入队, 不写会话日志。
+ *  工具完成后由 tools/post-execute 监听器把这些 notice 并入该工具结果的 additionalContexts,
+ *  交给 agent-loop 在 tool/result 之后、下个模型请求之前追加(官方 dsh-repeat-tool-reminder /
+ *  dsh-tool-goal 同款机制)—— 从不在 assistant(tool_calls) 与其 tool/result 之间插入
+ *  user/message, 因此不破坏模型消息序列。 */
+function queuePromptNotice(agent: unknown, text: string, summary: string): void {
+  const agentId = agentIdOf(agent)
+  if (agentId === undefined) {
+    console.warn('[harness-mcp-server] prompt notice skipped (agent has no id):', summary)
+    return
   }
+  const list = pendingNotices.get(agentId) ?? []
+  list.push({ text, summary })
+  pendingNotices.set(agentId, list)
+}
+
+/** tools/post-execute 安全投递: 该 agent 有挂起 notice 时, 把它们并入 downstream decision 的
+ *  additionalContexts(不改动 decision 本身); 没有则原样放行。 */
+function flushPromptNotices(agent: unknown, downstream: { kind?: string; additionalContexts?: unknown[] }): { kind?: string; additionalContexts?: unknown[] } {
+  const agentId = agentIdOf(agent)
+  if (agentId === undefined) return downstream
+  const notices = pendingNotices.get(agentId)
+  if (notices === undefined || notices.length === 0) return downstream
+  pendingNotices.delete(agentId)
+  const contexts = notices.map((n) => noticeUserMessage(n.text, n.summary))
+  return { ...downstream, additionalContexts: [...(downstream.additionalContexts ?? []), ...contexts] }
 }
 
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
@@ -1856,15 +1905,15 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         pendingApprovals.delete(promptId)
         req.signal?.removeEventListener('abort', onAbort)
         resolve(outcome)
-        // 【2】web UI 提示: 弹窗已被 MCP 响应
-        appendPromptNotice(req.agent.session, `✅ 审批 ${promptId} 已由 MCP 侧响应: ${outcome}`, `MCP 响应审批: ${outcome}`)
+        // 【2】web UI 提示(入队, 工具完成后安全落点): 弹窗已被 MCP 响应
+        queuePromptNotice(req.agent, `✅ 审批 ${promptId} 已由 MCP 侧响应: ${outcome}`, `MCP 响应审批: ${outcome}`)
       }
       const onAbort = () => settle('cancelled')
       pendingApprovals.set(promptId, { promptId, agentId, toolName: req.toolName, reason: req.reason, resolve: settle })
       req.signal?.addEventListener('abort', onAbort, { once: true })
-      // 【2】web UI 提示: 该审批已被 MCP 拦截接管, 用户打开会话界面可见
-      appendPromptNotice(
-        req.agent.session,
+      // 【2】web UI 提示(入队, 工具完成后安全落点): 该审批已被 MCP 拦截接管
+      queuePromptNotice(
+        req.agent,
         `⏳ 该审批（${req.toolName}${req.reason !== undefined ? `：${req.reason}` : ''}）已由 MCP 侧接管处理中，请在 Hermes/客户端响应（prompt ${promptId}）`,
         `MCP 接管审批: ${req.toolName}`,
       )
@@ -1874,6 +1923,18 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     'approval/request',
     onApprovalRequest,
     { prepend: true },
+  )
+
+  // ── notice 安全投递: 审批/提问拦截只入队, 工具完成( tools/post-execute )后并入 additionalContexts ──
+  // agent-loop 在 appendToolResult 之后把 additionalContexts splice 进 next-step inbox,
+  // 下个 step 开始时才追加为 user/message —— 从不在 assistant(tool_calls) 与其 tool/result 之间
+  // 插入消息(修复 0.9.4 起 notice 打断消息序列导致 INVALID_REQUEST 的回归)。
+  ;(ctx.on as unknown as (name: string, listener: unknown, options?: { prepend?: boolean }) => unknown)(
+    'tools/post-execute',
+    async (exec: unknown, _result: unknown, next: () => Promise<{ kind?: string; additionalContexts?: unknown[] }>) => {
+      const downstream = await next()
+      return flushPromptNotices((exec as { agent?: unknown }).agent, downstream)
+    },
   )
 
   // ── 提问 provider: 单槽能力缝; web GUI 已占用时降级(提问路由到 GUI, MCP 仍可感知但需在 GUI 应答) ──
@@ -1890,7 +1951,6 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
             signal?: AbortSignal
           }
           const promptId = `q-${randomUUID()}`
-          const session = r.agent !== undefined ? (r.agent as { session?: unknown }).session : undefined
           return new Promise((resolve, reject) => {
             let settled = false
             const settle = (fn: () => void) => {
@@ -1911,20 +1971,20 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
                 ...(q.options !== undefined ? { options: (q.options ?? []).map((o) => ({ label: o.label })) } : {}),
               })),
               resolve: (answer) => settle(() => {
-                // 【2】web UI 提示: 提问已由 MCP 响应
-                if (session !== undefined) appendPromptNotice(session, `✅ 提问 ${promptId} 已由 MCP 侧回答`, 'MCP 回答提问')
+                // 【2】web UI 提示(入队, 工具完成后安全落点): 提问已由 MCP 响应
+                if (r.agent !== undefined) queuePromptNotice(r.agent, `✅ 提问 ${promptId} 已由 MCP 侧回答`, 'MCP 回答提问')
                 resolve(answer)
               }),
               reject: (e) => settle(() => {
-                if (session !== undefined) appendPromptNotice(session, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, 'MCP 取消提问')
+                if (r.agent !== undefined) queuePromptNotice(r.agent, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, 'MCP 取消提问')
                 reject(e)
               }),
             })
             r.signal?.addEventListener('abort', onAbort, { once: true })
-            // 【2】web UI 提示: 该提问已被 MCP 拦截接管
-            if (session !== undefined) {
+            // 【2】web UI 提示(入队, 工具完成后安全落点): 该提问已被 MCP 拦截接管
+            if (r.agent !== undefined) {
               const first = r.questions[0]
-              appendPromptNotice(session, `⏳ 该提问（${first?.question ?? '…'}）已由 MCP 侧接管处理中，请在 Hermes/客户端响应（prompt ${promptId}）`, 'MCP 接管提问')
+              queuePromptNotice(r.agent, `⏳ 该提问（${first?.question ?? '…'}）已由 MCP 侧接管处理中，请在 Hermes/客户端响应（prompt ${promptId}）`, 'MCP 接管提问')
             }
           })
         },
@@ -2030,6 +2090,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       taskCancelHooks.clear()
       mcpSessionIds.clear()
       sessionModelOverrides.clear()
+      pendingNotices.clear()
       for (const pa of pendingApprovals.values()) pa.resolve('cancelled')
       pendingApprovals.clear()
       for (const pq of pendingQuestions.values()) pq.reject(new Error('harness-mcp-server unloaded'))

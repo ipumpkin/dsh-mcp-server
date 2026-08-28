@@ -55,7 +55,7 @@ import type { Context } from '@deepseek-ai/cordis';
 /** Cordis 插件名 */
 export declare const name = "harness-mcp-server";
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export declare const VERSION = "0.9.5";
+export declare const VERSION = "0.9.6";
 /**
  * 声明依赖的核心服务。
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——

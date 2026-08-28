@@ -9,6 +9,9 @@
 //   7. 上下文占用与压缩: session_list/task_list 输出 events/tokens/pressure/window/ratio; session_compact 走 ctx.compaction
 //   8. 运维/审计/选型: harness_status 水位、session_read 事件流、workspace_list 分组、model_list 目录、agent_run 按次 model 覆盖
 //   9. 客户端契约: 缺 cwd 报错、agent_run 超时转异步(taskId)+task_cancel、task_wait 阻塞等待、同步结果回填 taskId、isError 标记
+//   14. notice 安全落点(回归修复): 审批/提问拦截只入队不写日志; 工具完成后经 tools/post-execute
+//       并入 additionalContexts, 在 tool/result 之后追加 —— 不打断 assistant(tool_calls) 与其
+//       tool/result 的模型消息序列(无 INVALID_REQUEST); 反向控制验证旧版插入位置会被校验器检出
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -258,6 +261,52 @@ function innerOf(resp) {
   const r = payload.result
   if (r.isError) return { error: r.content?.[0]?.text ?? 'isError' }
   return JSON.parse(r.content[0].text)
+}
+
+// ── 增量14: notice 安全落点(回归修复)的假日志工具 ──
+// appendStep 按 harness 事件格式 push(seq 连续), 模拟真实 Session.append 的形状
+function appendStep(log, ev) {
+  log.push({ seq: log.length, ...ev })
+}
+// assistant 消息, 携带一条 tool-call 块(模型请求里正是这些 id 要求后续 tool/result 匹配)
+function makeAssistantWithToolCall(callId, name) {
+  return {
+    id: `asst-${callId}`,
+    role: 'assistant',
+    content: [{ type: 'tool-call', id: callId, name, arguments: '{}' }],
+    source: { kind: 'model', provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+  }
+}
+// tool/result 消息: content[0] 为 tool-result 块, 带 toolCallId 回指 assistant 的 tool-call
+function makeToolResult(callId, text) {
+  return {
+    id: `tool-${callId}`,
+    role: 'user',
+    content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text }] }],
+    source: { kind: 'tool', name: 'bash', callId },
+  }
+}
+// 复现 OpenAI 兼容约束: assistant 带 tool-call 后, 后续模型消息必须依次紧跟对应 tool/result
+// (toolCallId 按序匹配), 期间插入任何 user/assistant 消息都判为 INVALID_REQUEST。
+function modelSequenceError(log) {
+  const pending = []
+  for (const e of log) {
+    if (e.type !== 'user/message' && e.type !== 'assistant/message' && e.type !== 'tool/result') continue
+    const msg = e.type === 'user/message' ? e.data : e.data?.message
+    if (!msg) continue
+    const calls = (msg.content ?? []).filter((b) => b?.type === 'tool-call' && b?.id !== undefined)
+    if (calls.length > 0) {
+      for (const c of calls) pending.push(c.id)
+      continue
+    }
+    if (pending.length > 0) {
+      if (e.type !== 'tool/result' || msg.content?.[0]?.type !== 'tool-result' || msg.content[0].toolCallId !== pending[0]) {
+        return `assistant(tool_calls) 后插入了 ${e.type}, 待响应 tool_call_id: ${pending.join(',')}`
+      }
+      pending.shift()
+    }
+  }
+  return pending.length > 0 ? `未闭合的 tool_call_id: ${pending.join(',')}` : null
 }
 
 const checks = {}
@@ -586,11 +635,40 @@ try {
   checks['审批后任务继续并完成'] = apprDone?.status === 'done'
     && agentsById.get(String(apprDone?.result?.sessionId))?.approvalOutcome === 'allowed-once'
 
-  // 【2】web UI 提示: 会话日志应出现 form:'notice' 的接管/已响应提示
+  // 【2】web UI 提示(安全落点, 回归修复): 拦截只入队不写日志; 工具完成后经 tools/post-execute 把
+  // notice 并入 additionalContexts, 由 agent-loop 在 tool/result 之后追加 —— 断言拦截期日志未被
+  // 污染, 且落点后的模型消息序列满足「assistant 带 tool_calls 后必须紧跟对应 tool/result」约束(无 INVALID_REQUEST)。
   const apprAgent = agentsById.get(String(apprDone?.result?.sessionId))
-  const apprNotices = (apprAgent?.session.log ?? []).filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
-  checks['web UI 提示: 会话收到 MCP 接管 notice'] = apprNotices.some((n) => String(n.data?.content?.[0]?.text ?? '').includes('MCP 侧接管'))
-  checks['web UI 提示: 审批解决后收到已响应 notice'] = apprNotices.some((n) => String(n.data?.content?.[0]?.text ?? '').includes('已由 MCP 侧响应'))
+  const apprLog = apprAgent?.session.log ?? []
+  const apprNoticesAtIntercept = apprLog.filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
+  checks['notice: 审批拦截/响应只入队, 不污染会话日志'] = apprNoticesAtIntercept.length === 0
+  // 模拟 harness 循环提交该 step 的日志形状(assistant 带 tool-call → tool/call → tool/result)
+  appendStep(apprLog, { type: 'assistant/message', data: { turn: 1, step: 1, message: makeAssistantWithToolCall('c-1', 'bash') } })
+  appendStep(apprLog, { type: 'tool/call', data: { turn: 1, step: 1, callId: 'c-1', name: 'bash', arguments: '{}' } })
+  appendStep(apprLog, { type: 'tool/result', data: { turn: 1, step: 1, message: makeToolResult('c-1', 'done') } })
+  const apprToolResultIdx = apprLog.length - 1
+  // 触发注册的 tools/post-execute 处理链(harness 每次工具完成后都会跑), 模拟 next() 链
+  let apprDecision = { kind: 'accept' }
+  for (const h of eventHandlers.get('tools/post-execute') ?? []) {
+    apprDecision = await h({ agent: apprAgent, callId: 'c-1', name: 'bash' }, { isError: false, content: [] }, async () => apprDecision)
+  }
+  const apprFlushed = (apprDecision.additionalContexts ?? []).filter((m) => m?.source?.form === 'notice')
+  // 模拟 agent-loop: appendToolResult 后把 additionalContexts splice 进 next-step inbox,
+  // 下个 step 开始时追加为 user/message(落点在 tool/result 之后)
+  for (const msg of apprFlushed) appendStep(apprLog, { type: 'user/message', data: msg })
+  const apprNoticeIdx = apprLog.findIndex((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
+  checks['notice: 审批提示在 tool/result 之后安全落点'] = apprFlushed.length === 2 && apprNoticeIdx > apprToolResultIdx
+  checks['notice: 追加后模型消息序列合法(无 INVALID_REQUEST)'] = modelSequenceError(apprLog) === null
+  // 反向控制: 旧版错误插入(user/message 插在 assistant(tool_calls) 与 tool/result 之间)必须被校验器检出
+  {
+    const brokenLog = [
+      { seq: 0, type: 'user/message', data: { id: 'u0', role: 'user', content: [{ type: 'text', text: 'task' }], source: { kind: 'human' } } },
+      { seq: 1, type: 'assistant/message', data: { turn: 1, step: 1, message: makeAssistantWithToolCall('b-c1', 'bash') } },
+      { seq: 2, type: 'user/message', data: { id: 'n0', role: 'user', content: [{ type: 'text', text: '⏳ notice' }], source: { kind: 'plugin', plugin: 'harness-mcp-server', form: 'notice', summary: 'x' } } },
+      { seq: 3, type: 'tool/result', data: { turn: 1, step: 1, message: makeToolResult('b-c1', 'ok') } },
+    ]
+    checks['回归可复现: 旧版插入位置被序列校验器判为 INVALID_REQUEST'] = typeof modelSequenceError(brokenLog) === 'string'
+  }
 
   // 提问流程: 模拟 ask_user_question 走我们持有的 provider → 感知 → prompt_respond answer → 解除阻塞
   const qAgent = agentsById.get(String(created[4]?.id))
@@ -607,9 +685,25 @@ try {
   checks['prompt_respond: 提问自由文本回答'] = innerOf(respQ).ok === true
   const qAnswer = await askPromise
   checks['提问 provider 收到回答'] = qAnswer.answers?.[0]?.custom === 'pg'
-  const qNotices = (qAgent?.session.log ?? []).filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
-  checks['提问流程: 会话收到接管/回答 notice'] = qNotices.some((n) => String(n.data?.content?.[0]?.text ?? '').includes('MCP 侧接管'))
-    && qNotices.some((n) => String(n.data?.content?.[0]?.text ?? '').includes('已由 MCP 侧回答'))
+  // 【2】提问 notice(安全落点): 拦截只入队; 工具完成后统一经 tools/post-execute 落点
+  const qLog = qAgent?.session.log ?? []
+  const qNoticesAtIntercept = qLog.filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
+  checks['提问 notice: 拦截期不写日志'] = qNoticesAtIntercept.length === 0
+  appendStep(qLog, { type: 'assistant/message', data: { turn: 1, step: 1, message: makeAssistantWithToolCall('q-c1', 'ask_user_question') } })
+  appendStep(qLog, { type: 'tool/call', data: { turn: 1, step: 1, callId: 'q-c1', name: 'ask_user_question', arguments: '{}' } })
+  appendStep(qLog, { type: 'tool/result', data: { turn: 1, step: 1, message: makeToolResult('q-c1', 'answered') } })
+  const qToolResultIdx = qLog.length - 1
+  let qDecision = { kind: 'accept' }
+  for (const h of eventHandlers.get('tools/post-execute') ?? []) {
+    qDecision = await h({ agent: qAgent, callId: 'q-c1', name: 'ask_user_question' }, { isError: false, content: [] }, async () => qDecision)
+  }
+  const qFlushed = (qDecision.additionalContexts ?? []).filter((m) => m?.source?.form === 'notice')
+  for (const msg of qFlushed) appendStep(qLog, { type: 'user/message', data: msg })
+  const qNoticeIdx = qLog.findIndex((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
+  checks['提问 notice: 在 tool/result 之后安全落点'] = qFlushed.length === 2 && qNoticeIdx > qToolResultIdx
+  checks['提问 notice: 含接管/回答提示且序列合法(无 INVALID_REQUEST)'] = qFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('MCP 侧接管'))
+    && qFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('已由 MCP 侧回答'))
+    && modelSequenceError(qLog) === null
 
   // ── 增量13: 模型/执行失败反映到任务结果 + 切模型 + 注入 ──
   const errInbox = await call(init.sid, 'task_inbox', { task: 'boom', cwd: ERROR_CWD })

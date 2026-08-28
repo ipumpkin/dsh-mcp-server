@@ -103,6 +103,13 @@ So the reuse policy is fully external: want cheap repeated tasks in one context 
   `events`/`toolCalls` count only this task's log delta (from its start); `currentTool` is the latest tool call in flight; `lastText` is the agent's most recent visible text.
 - Errors are returned as `{ "error": ... }` JSON with the MCP `isError` flag set, so clients can distinguish failures from successful runs.
 
+### Approval/question takeover & web UI notices
+
+When MCP intercepts an approval or a question, the web session view shows two collapsed notice rows (`user/message` with `source.form: 'notice'`: taken-over + responded). **Notices use a safe-placement mechanism**: at interception time (`approval/request` / the question provider) the hint is only queued — never written to the session log directly; once that tool finishes, a `tools/post-execute` listener merges the queued hints into the tool result's `additionalContexts`, and the agent-loop appends them as `user/message` events **after the `tool/result` and before the next model request** (the same mechanism `dsh-repeat-tool-reminder` / `dsh-tool-goal` use).
+
+- This guarantees a notice can never land between an assistant message carrying `tool_calls` and its `tool/result` — the old behavior (since 0.9.4) appended the `user/message` right at interception, and when that fell between the two, the next model request failed with `An assistant message with tool_calls must be followed by tool messages responding to each tool_call_id` (INVALID_REQUEST), corrupting the session.
+- **Sessions already corrupted** by the old code cannot be repaired in place: just **start a new session** — `agent_run` without `sessionId` opens/reuses a fresh one, or pass `newSession: true` for a guaranteed-fresh session; the old session can be ignored or retired via `session_close`, and no other session is affected. This plugin never rewrites historical logs.
+
 ### Context usage & compaction
 
 Because sessions grow with reuse, `session_list` and `task_list` report **context occupancy** for every row whose session is live:

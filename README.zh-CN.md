@@ -105,6 +105,13 @@ agent 循环一旦卡死，任务会无限阻塞 MCP 客户端。有两道保护
   `events`/`toolCalls` 只统计本任务从起点开始的日志增量；`currentTool` 是最近一次进行中的工具调用；`lastText` 是 agent 最近可见的文本。
 - 错误响应统一为 `{ "error": ... }` JSON 并带 MCP `isError` 标记，客户端可区分失败与成功。
 
+### 审批/提问接管与 web UI 提示（notice）
+
+MCP 拦截审批/提问后，web 会话界面会收到两条折叠提示行（`form:'notice'` 的 `user/message`：接管中 + 已响应）。**通知采用安全落点机制**：拦截（`approval/request` / 提问 provider）时只把提示入队、绝不直接写会话日志；待该工具执行完成，由 `tools/post-execute` 监听器把提示并入工具结果的 `additionalContexts`，交给 agent-loop 在 `tool/result` 之后、下个模型请求之前追加（与 `dsh-repeat-tool-reminder` / `dsh-tool-goal` 官方插件同款机制）。
+
+- 这保证 notice **从不会插进 assistant 带 `tool_calls` 的消息与其 `tool/result` 之间**——旧版（0.9.4 起）直接在拦截期 append `user/message`，若时机落在两者之间会打断模型消息序列，使下个模型请求报 `An assistant message with tool_calls must be followed by tool messages responding to each tool_call_id`（INVALID_REQUEST），会话失效。
+- **已损坏的会话**（旧版代码曾把 notice 写进中间位置）：无法就地修复，直接**重新开会话**即可——`agent_run` 不带 `sessionId` 会开/复用新会话，或传 `newSession: true` 强制全新会话；旧会话可忽略或 `session_close` 退役，不影响其他会话。本插件不重写历史日志。
+
 ### 上下文占用与压缩
 
 既然会话随复用而增长，`session_list` 和 `task_list` 会对每个 live 会话行输出**上下文占用**：
