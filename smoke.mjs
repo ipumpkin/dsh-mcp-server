@@ -94,7 +94,8 @@ const fakePersistence = {
 }
 
 // tokenMeter / llm / compaction 的只读 fake: 测量按日志长度估 token(sess-live 特例 30 验证 ratio);
-// llm.resolveModel 固定窗口 200; compactNow 记录调用并返回固定结果
+// llm.resolveModelInfo 固定窗口 200(未知模型抛错 → 验证 window/ratio 为 null 的降级路径);
+// compactNow 记录调用并返回固定结果
 const fakeMeter = {
   measure: (session) => {
     const len = session?.log?.length ?? 0
@@ -103,7 +104,10 @@ const fakeMeter = {
   },
 }
 const fakeLlm = {
-  resolveModel: async () => ({ id: 'deepseek-v4-flash', context: { contextWindow: 200 } }),
+  resolveModelInfo: async (provider, model) => {
+    if (model === 'nope-model') throw new Error(`unknown model ${model}`)
+    return { provider, id: model, context: { contextWindow: 200 } }
+  },
   listProviders: () => [
     { id: 'deepseek-official', name: 'DeepSeek' },
     { id: 'zai', name: 'ZAI' },
@@ -303,6 +307,10 @@ try {
   const runLive = await call(init.sid, 'agent_run', { task: 'say ok', sessionId: 'sess-live' })
   const runLiveInner = runLive.status === 200 ? innerOf(runLive) : { error: 'bad' }
   checks['agent_run 接管 live 会话(不 resume 不 dispose)'] = runLiveInner.sessionId === 'sess-live' && resumed.length === 0 && disposed.length === 0
+  checks['agent_run 结果带上下文占用(events/tokens/pressure/window/ratio)'] = runLiveInner.context !== null
+    && typeof runLiveInner.context.events === 'number' && runLiveInner.context.tokens === 30
+    && runLiveInner.context.window === 200 && runLiveInner.context.ratio === 15
+  checks['agent_run 结果上下文含 pressure 字段'] = typeof runLiveInner.context?.pressure === 'number'
 
   const runPersisted = await call(init.sid, 'agent_run', { task: 'say ok', sessionId: 'sess-persisted' })
   const runPersistedInner = runPersisted.status === 200 ? innerOf(runPersisted) : { error: 'bad' }
@@ -333,6 +341,7 @@ try {
   const inbox = await call(init.sid, 'task_inbox', { task: 'say ok async', cwd: FAKE_CWD })
   const inboxInner = inbox.status === 200 ? innerOf(inbox) : { error: 'bad' }
   checks['task_inbox 返回 taskId'] = Boolean(inboxInner.taskId)
+  checks['task_inbox 回复带 context(queued 无会话可测 → null)'] = 'context' in inboxInner && inboxInner.context === null
 
   let done
   for (let i = 0; i < 50; i++) {
@@ -342,6 +351,9 @@ try {
     if (inner.status === 'done' || inner.status === 'error') { done = inner; break }
   }
   checks['task_inbox 异步执行到 done'] = done?.status === 'done' && Boolean(done.result?.sessionId)
+  checks['task_result 终态带上下文(顶层 context + result.context)'] = done?.context !== null
+    && typeof done?.context?.events === 'number' && done?.context?.window === 200
+    && done?.result?.context?.window === 200 && done?.result?.context?.ratio !== null
 
   const cancelDone = await call(init.sid, 'task_cancel', { taskId: inboxInner.taskId })
   checks['task_cancel 已结束任务 no-op'] = innerOf(cancelDone).cancelled === false && innerOf(cancelDone).note === 'already finished'
@@ -440,6 +452,8 @@ try {
   const modelInner = modelRun.status === 200 ? innerOf(modelRun) : { error: 'bad' }
   checks['agent_run model 参数: 透传到 create'] = modelInner.sessionId === created[4]?.id
     && created[4]?.options?.model === 'custom-model'
+  checks['agent_run 结果上下文 window 按会话模型解析'] = modelInner.context?.window === 200
+    && modelInner.context?.ratio !== null
 
   const models = await call(init.sid, 'model_list', {})
   const modelsInner = innerOf(models)
@@ -467,6 +481,8 @@ try {
   const convInner = conv.status === 200 ? innerOf(conv) : { error: 'bad' }
   checks['agent_run 超时转异步(返回 taskId)'] = convInner.status === 'async' && Boolean(convInner.taskId)
   checks['转异步响应带进行中进度'] = convInner.progress?.status === 'running' && typeof convInner.progress?.events === 'number'
+  checks['转异步 progress 带上下文占用'] = convInner.progress?.context !== null
+    && typeof convInner.progress?.context?.tokens === 'number' && convInner.progress?.context?.window === 200
 
   const convCancel = await call(init.sid, 'task_cancel', { taskId: convInner.taskId })
   checks['agent_run 转异步后可 task_cancel 取消'] = innerOf(convCancel).cancelled === true
@@ -488,6 +504,8 @@ try {
   const waitInner = waitRes.status === 200 ? innerOf(waitRes) : { error: 'bad' }
   checks['task_wait 阻塞等待到 done'] = waitInner.status === 'done' && Boolean(waitInner.result?.sessionId)
   checks['task_wait 结果带进度(终态)'] = waitInner.progress?.status === 'done' && typeof waitInner.progress?.toolCalls === 'number'
+  checks['task_wait 结果带上下文占用'] = waitInner.context?.window === 200 && waitInner.result?.context?.window === 200
+    && typeof waitInner.result?.context?.ratio === 'number'
   const waitUnknown = await call(init.sid, 'task_wait', { taskId: 'nope-456' })
   checks['task_wait 未知任务报错'] = typeof innerOf(waitUnknown).error === 'string'
 
@@ -630,6 +648,13 @@ try {
     && inboxAppends.some((x) => String(x.m?.content?.[0]?.text ?? '').includes('git status') && x.t === 'next-turn')
   const injUnknown = await call(init.sid, 'session_inject', { sessionId: 'sess-unknown', message: 'x' })
   checks['session_inject: 未知会话报错'] = String(innerOf(injUnknown).error ?? '').includes('session not found')
+
+  // 窗口不可解析(resolveModelInfo 抛错/未知模型): window/ratio 必须为 null 而非崩溃, tokens 仍可读。
+  // 放在流程末尾: newSession:true 会退役同 cwd 的池会话, 避免干扰前面的 session_set_model/session_inject 用例
+  const nopeModel = await call(init.sid, 'agent_run', { task: 'no window', cwd: FAKE_CWD, newSession: true, model: 'nope-model' })
+  const nopeInner = nopeModel.status === 200 ? innerOf(nopeModel) : { error: 'bad' }
+  checks['窗口不可解析: context.window/ratio 为 null(不崩溃)'] = nopeInner.context?.window === null
+    && nopeInner.context?.ratio === null && typeof nopeInner.context?.tokens === 'number'
 
   // ── 增量3: 启动存量捞回(sessions.list + sessionPersistence.list 两源) ──
   await new Promise((r) => setTimeout(r, 500))
