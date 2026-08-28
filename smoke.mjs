@@ -32,6 +32,7 @@ const HANG_SET = new Set([HANG_CWD, HANG_CWD2, HANG_CWD3, HANG_CWD4])
 // 审批弹窗 / 模型失败专用 cwd
 const APPROVAL_CWD = resolve(FAKE_CWD, 'approval-zone')
 const ERROR_CWD = resolve(FAKE_CWD, 'error-zone')
+const THROW_CWD = resolve(FAKE_CWD, 'throw-zone')
 
 // 事件注册表 + 用户提问 provider 捕获(prepend 顺序用于验证审批应答者优先级)
 const eventHandlers = new Map()
@@ -55,9 +56,21 @@ const inboxAppends = []
 const agentsById = new Map()
 
 function makeAgent(id, cwd) {
+  const log = []
+  const events = []
+  const session = {
+    id, log, events,
+    header: { version: 0, id, createdAt: Date.now(), cwd },
+    append: (type, data) => {
+      const ev = { seq: log.length, type, data }
+      log.push(ev)
+      events.push(ev)
+      return ev
+    },
+  }
   return {
     id,
-    session: { id, log: [], events: [], header: { version: 0, id, createdAt: Date.now(), cwd } },
+    session,
     options: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
     status: 'idle',
     followup: () => {},
@@ -161,12 +174,17 @@ const ctx = {
         }
         agent.whenIdle = () => new Promise((res) => { settleTurn = res })
       }
-      // 模型失败 agent: followup 时写入 failed turn/end(模拟 LLM 配额/网络错误)
+      // 模型失败 agent: followup 写入真实失败形态(turn/end reason.kind='error' + LlmFailure, 对照实测 429 QUOTA 会话)
       if (meta?.cwd === ERROR_CWD) {
         agent.followup = () => {
-          agent.session.log.push({ seq: agent.session.log.length, type: 'turn/start', data: { turn: 0 } })
-          agent.session.log.push({ seq: agent.session.log.length, type: 'turn/end', data: { turn: 0, reason: { kind: 'failed', error: { code: 'RATE_LIMITED', message: 'quota exhausted' } } } })
+          agent.session.append('turn/start', { turn: 1 })
+          agent.session.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'finish', reason: { kind: 'error', failure: { message: '429: Usage limit reached for 5 hour', code: 'QUOTA' } } } })
+          agent.session.append('turn/end', { turn: 1, reason: { kind: 'error', error: { message: '429: Usage limit reached for 5 hour', code: 'QUOTA' } } })
         }
+      }
+      // 执行异常 agent: whenIdle 直接抛错(模拟 agent-loop/调度层异常)
+      if (meta?.cwd === THROW_CWD) {
+        agent.whenIdle = () => Promise.reject(new Error('agent loop crashed'))
       }
       return { agent, dispose: async () => { disposed.push(id) } }
     },
@@ -550,6 +568,12 @@ try {
   checks['审批后任务继续并完成'] = apprDone?.status === 'done'
     && agentsById.get(String(apprDone?.result?.sessionId))?.approvalOutcome === 'allowed-once'
 
+  // 【2】web UI 提示: 会话日志应出现 form:'notice' 的接管/已响应提示
+  const apprAgent = agentsById.get(String(apprDone?.result?.sessionId))
+  const apprNotices = (apprAgent?.session.log ?? []).filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
+  checks['web UI 提示: 会话收到 MCP 接管 notice'] = apprNotices.some((n) => String(n.data?.content?.[0]?.text ?? '').includes('MCP 侧接管'))
+  checks['web UI 提示: 审批解决后收到已响应 notice'] = apprNotices.some((n) => String(n.data?.content?.[0]?.text ?? '').includes('已由 MCP 侧响应'))
+
   // 提问流程: 模拟 ask_user_question 走我们持有的 provider → 感知 → prompt_respond answer → 解除阻塞
   const qAgent = agentsById.get(String(created[4]?.id))
   const askPromise = capturedProvider.ask({
@@ -565,6 +589,9 @@ try {
   checks['prompt_respond: 提问自由文本回答'] = innerOf(respQ).ok === true
   const qAnswer = await askPromise
   checks['提问 provider 收到回答'] = qAnswer.answers?.[0]?.custom === 'pg'
+  const qNotices = (qAgent?.session.log ?? []).filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
+  checks['提问流程: 会话收到接管/回答 notice'] = qNotices.some((n) => String(n.data?.content?.[0]?.text ?? '').includes('MCP 侧接管'))
+    && qNotices.some((n) => String(n.data?.content?.[0]?.text ?? '').includes('已由 MCP 侧回答'))
 
   // ── 增量13: 模型/执行失败反映到任务结果 + 切模型 + 注入 ──
   const errInbox = await call(init.sid, 'task_inbox', { task: 'boom', cwd: ERROR_CWD })
@@ -575,11 +602,23 @@ try {
     if (inner.status === 'done' || inner.status === 'error') { errDone = inner; break }
   }
   checks['模型错误: 任务 status=error + 结构化 error'] = errDone?.status === 'error'
-    && errDone?.result?.error?.errorCode === 'RATE_LIMITED' && errDone?.result?.error?.errorCategory === 'model'
-    && String(errDone?.error ?? '').includes('RATE_LIMITED')
+    && errDone?.result?.error?.errorCode === 'QUOTA' && errDone?.result?.error?.errorCategory === 'model'
+    && String(errDone?.error ?? '').includes('QUOTA')
   const errSync = await call(init.sid, 'agent_run', { task: 'boom sync', cwd: ERROR_CWD, timeoutMs: 3000 })
   checks['agent_run 同步路径模型错误 isError'] = parsePayload(errSync.text).result?.isError === true
-    && String(innerOf(errSync).error ?? '').includes('RATE_LIMITED')
+    && String(innerOf(errSync).error ?? '').includes('QUOTA')
+
+  // 执行/调度层异常(whenIdle 抛错): 1c 转结构化 execution error
+  const throwInbox = await call(init.sid, 'task_inbox', { task: 'crash', cwd: THROW_CWD })
+  let throwDone
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 50))
+    const inner = innerOf(await call(init.sid, 'task_result', { taskId: innerOf(throwInbox).taskId }))
+    if (inner.status === 'done' || inner.status === 'error') { throwDone = inner; break }
+  }
+  checks['执行异常: 转结构化 execution error'] = throwDone?.status === 'error'
+    && throwDone?.result?.error?.errorCategory === 'execution'
+    && String(throwDone?.result?.error?.errorMessage ?? '').includes('agent loop crashed')
 
   const setModel = await call(init.sid, 'session_set_model', { sessionId: String(created[4]?.id), model: 'glm-5.3' })
   const sm = innerOf(setModel)

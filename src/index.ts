@@ -74,7 +74,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = '0.9.1'
+export const VERSION = '0.9.3'
 
 /**
  * 声明依赖的核心服务。
@@ -658,6 +658,21 @@ function detectPendingAskUser(session: unknown): { id: string; questions: Array<
   return { id: `ask-${callIdx}`, questions }
 }
 
+/** 向会话追加一条 UI 可见的 notice 消息: form:'notice' 的 plugin 来源 user/message,
+ *  web UI 以折叠提示行专属呈现(与 dsh-plan-mode/dsh-tool-goal 等官方插件同款机制)。
+ *  让用户打开 web 会话界面即可看到「该审批/提问已被 MCP 侧接管处理中」的提示。 */
+function appendPromptNotice(session: unknown, text: string, summary: string): void {
+  try {
+    const s = session as { append?: (type: 'user/message', data: unknown, opts?: { surfaceOp?: string }) => unknown }
+    s.append?.('user/message', createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: 'harness-mcp-server', form: 'notice' as const, summary },
+    }), { surfaceOp: 'append' })
+  } catch (e) {
+    console.warn('[harness-mcp-server] prompt notice append failed:', (e as Error)?.message ?? e)
+  }
+}
+
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
  *  opts.onAgent 在 agent 就绪后回调一次, 供 task_cancel 注册打断钩子;
  *  opts.fresh = true 且未传 sessionId 时强制全新会话(跳过池复用, 见 getAgent);
@@ -703,40 +718,54 @@ async function executeTask(
       `{"changes":"改了什么","verification":"怎么验证的","leftovers":"遗留问题"}`,
     ].filter(Boolean).join('\n')
 
-    handle.agent.followup(
-      createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } }),
-    )
-    // agent 就绪: 通知调用方(供 task_cancel 注册打断钩子)
-    opts?.onAgent?.(handle.agent)
-
-    // 超时保护: whenIdle 无限等待会让 MCP 客户端挂死; 到点后 cancel 打断本轮, 回收部分输出
-    // (per-task timeoutMs 覆盖全局 taskTimeoutMs)
-    const taskTimeout = opts?.timeoutMs ?? runtimeConfig.taskTimeoutMs
-    let timedOut = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      await Promise.race([
-        handle.agent.whenIdle(),
-        new Promise<never>((_resolve, reject) => {
-          if (taskTimeout > 0) {
-            timer = setTimeout(() => { timedOut = true; reject(TASK_TIMEOUT) }, taskTimeout)
-          }
-        }),
-      ])
-    } catch (e) {
-      if (e !== TASK_TIMEOUT) throw e
-      // cancel 丢弃未开始的排队输入, 中止活动回合; 之后 whenIdle 很快落定
-      try { handle.agent.cancel({ kind: 'hook', reason: 'harness-mcp-timeout' }) } catch { /* 打断失败不阻断回收 */ }
-      await handle.agent.whenIdle()
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
-    }
-
-    // 结构化读输出
+    // 结构化读输出(提前声明, 供执行异常兜底填充)
     const result: TaskResult = {
       taskId: '', sessionId, assistantText: '', toolCalls: [], toolResults: [],
       changes: '', verification: '', leftovers: '',
     }
+
+    // 驱动 agent 执行; 执行/调度层抛出的异常(非超时)转成结构化 error 结果, 不再上抛导致空跑
+    try {
+      handle.agent.followup(
+        createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } }),
+      )
+      // agent 就绪: 通知调用方(供 task_cancel 注册打断钩子)
+      opts?.onAgent?.(handle.agent)
+
+      // 超时保护: whenIdle 无限等待会让 MCP 客户端挂死; 到点后 cancel 打断本轮, 回收部分输出
+      // (per-task timeoutMs 覆盖全局 taskTimeoutMs)
+      const taskTimeout = opts?.timeoutMs ?? runtimeConfig.taskTimeoutMs
+      let timedOut = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          handle.agent.whenIdle(),
+          new Promise<never>((_resolve, reject) => {
+            if (taskTimeout > 0) {
+              timer = setTimeout(() => { timedOut = true; reject(TASK_TIMEOUT) }, taskTimeout)
+            }
+          }),
+        ])
+      } catch (e) {
+        if (e !== TASK_TIMEOUT) throw e
+        // cancel 丢弃未开始的排队输入, 中止活动回合; 之后 whenIdle 很快落定
+        try { handle.agent.cancel({ kind: 'hook', reason: 'harness-mcp-timeout' }) } catch { /* 打断失败不阻断回收 */ }
+        await handle.agent.whenIdle()
+        result.timeout = true
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+    } catch (e) {
+      // 【1c】agent 执行/调度层异常(如 agent-loop 抛错): 转成结构化 error 结果, 任务以 status=error 结束
+      const err = e as { code?: string; message?: string; name?: string }
+      result.error = {
+        errorCode: err?.code ?? 'AGENT_ERROR',
+        errorMessage: err?.message ?? String(e),
+        errorCategory: 'execution',
+      }
+    }
+
+    // 结构化读输出
     try {
       const log = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).slice(baseline)
       for (const e of log) {
@@ -764,17 +793,31 @@ async function executeTask(
           if (texts.length) result.toolResults.push(texts.join('\n').slice(0, 3000))
         }
       }
-      // 【1】模型/执行失败感知: turn/end reason.kind==='failed' → 结构化错误
-      // (LLM 错误码原样保留——配额/网络/非法参数; 'UNKNOWN' 视为通用执行失败; 超时由 timeout 标记区分)
+      // 【1b】模型/执行失败感知: turn/end reason.kind ∈ {error, failed, max-tokens} → 结构化错误。
+      // 真实模型接口报错(配额/网络/参数)以 reason.kind='error' 出现(实测 429 QUOTA 会话),
+      // 'max-tokens' 为输出上限(模型侧限制); LLM 错误码原样保留, 'UNKNOWN' 视为通用执行失败。
       for (const e of log) {
-        const ev = e as { type?: string; data?: { reason?: { kind?: string; error?: { code?: string; message?: string } } } }
-        if (ev.type === 'turn/end' && ev.data?.reason?.kind === 'failed') {
-          const err = ev.data.reason.error
-          const code = err?.code ?? 'UNKNOWN'
+        const ev = e as {
+          type?: string
+          data?: { reason?: { kind?: string; error?: { code?: string; message?: string } }; chunk?: { type?: string; reason?: { kind?: string; failure?: { code?: string; message?: string } } } }
+        }
+        const reason = ev.data?.reason
+        if (ev.type === 'turn/end' && reason !== undefined && (reason.kind === 'error' || reason.kind === 'failed' || reason.kind === 'max-tokens')) {
+          const err = (reason.kind === 'error' || reason.kind === 'failed') ? reason.error : undefined
+          const code = err?.code ?? (reason.kind === 'max-tokens' ? 'MAX_TOKENS' : 'UNKNOWN')
           result.error = {
             errorCode: code,
-            errorMessage: err?.message ?? 'agent turn failed',
+            errorMessage: err?.message ?? (reason.kind === 'max-tokens' ? 'output token ceiling reached' : 'agent turn failed'),
             errorCategory: code === 'UNKNOWN' ? 'execution' : 'model',
+          }
+          break
+        }
+        // 兜底: assistant/chunk finish 报错(未及 turn/end 时)
+        if (ev.type === 'assistant/chunk' && ev.data?.chunk?.type === 'finish' && ev.data.chunk.reason?.kind === 'error' && ev.data.chunk.reason.failure) {
+          result.error = {
+            errorCode: ev.data.chunk.reason.failure.code ?? 'MODEL_ERROR',
+            errorMessage: ev.data.chunk.reason.failure.message ?? 'model request failed',
+            errorCategory: 'model',
           }
           break
         }
@@ -796,8 +839,7 @@ async function executeTask(
     }
 
     // 超时标注: leftovers 为空时补一句引导, 提示可用 sessionId 续接
-    result.timeout = timedOut
-    if (timedOut && !result.leftovers) {
+    if (result.timeout === true && !result.leftovers) {
       result.leftovers = '任务超时被自动取消, 以上为部分进展; 可用 sessionId 续接继续'
     }
 
@@ -1773,10 +1815,18 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         pendingApprovals.delete(promptId)
         req.signal?.removeEventListener('abort', onAbort)
         resolve(outcome)
+        // 【2】web UI 提示: 弹窗已被 MCP 响应
+        appendPromptNotice(req.agent.session, `✅ 审批 ${promptId} 已由 MCP 侧响应: ${outcome}`, `MCP 响应审批: ${outcome}`)
       }
       const onAbort = () => settle('cancelled')
       pendingApprovals.set(promptId, { promptId, agentId, toolName: req.toolName, reason: req.reason, resolve: settle })
       req.signal?.addEventListener('abort', onAbort, { once: true })
+      // 【2】web UI 提示: 该审批已被 MCP 拦截接管, 用户打开会话界面可见
+      appendPromptNotice(
+        req.agent.session,
+        `⏳ 该审批（${req.toolName}${req.reason !== undefined ? `：${req.reason}` : ''}）已由 MCP 侧接管处理中，请在 Hermes/客户端响应（prompt ${promptId}）`,
+        `MCP 接管审批: ${req.toolName}`,
+      )
     })
   }
   ;(ctx.on as unknown as (name: string, listener: unknown, options?: { prepend?: boolean }) => unknown)(
@@ -1795,10 +1845,11 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         ask: (request) => {
           const r = request as {
             questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }>
-            agent?: { id: unknown }
+            agent?: { id: unknown; session?: unknown }
             signal?: AbortSignal
           }
           const promptId = `q-${randomUUID()}`
+          const session = r.agent !== undefined ? (r.agent as { session?: unknown }).session : undefined
           return new Promise((resolve, reject) => {
             let settled = false
             const settle = (fn: () => void) => {
@@ -1818,10 +1869,22 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
                 ...(q.detail !== undefined ? { detail: q.detail } : {}),
                 ...(q.options !== undefined ? { options: (q.options ?? []).map((o) => ({ label: o.label })) } : {}),
               })),
-              resolve: (answer) => settle(() => resolve(answer)),
-              reject: (e) => settle(() => reject(e)),
+              resolve: (answer) => settle(() => {
+                // 【2】web UI 提示: 提问已由 MCP 响应
+                if (session !== undefined) appendPromptNotice(session, `✅ 提问 ${promptId} 已由 MCP 侧回答`, 'MCP 回答提问')
+                resolve(answer)
+              }),
+              reject: (e) => settle(() => {
+                if (session !== undefined) appendPromptNotice(session, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, 'MCP 取消提问')
+                reject(e)
+              }),
             })
             r.signal?.addEventListener('abort', onAbort, { once: true })
+            // 【2】web UI 提示: 该提问已被 MCP 拦截接管
+            if (session !== undefined) {
+              const first = r.questions[0]
+              appendPromptNotice(session, `⏳ 该提问（${first?.question ?? '…'}）已由 MCP 侧接管处理中，请在 Hermes/客户端响应（prompt ${promptId}）`, 'MCP 接管提问')
+            }
           })
         },
       })
