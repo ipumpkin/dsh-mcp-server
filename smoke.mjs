@@ -20,6 +20,13 @@
 //       session/title 事件落日志), 结果带 title, session_list 池行可见; 显式 title 优先;
 //       sessionTitle 服务缺失时静默降级不崩溃。notice 原生呈现契约: form:'notice' + 折叠行
 //       summary 非空(web UI contextForm 识别 notice 的专属呈现), 文案为 ⏳/✅ 系统状态措辞。
+//   17. 挂起期即时投递: 审批/提问被 MCP 拦截的 ⏳ 提示在拦截当下立即追加到 agent 的 next-step
+//       inbox(source: { kind: 'user' }, web GUI steering 同款形状 —— 宿主在 agent/inbox/spliced
+//       事件上即时 broadcast session/queue(placement 'steering'), web UI 当场渲染
+//       PendingSteeringBubble, 用户响应前即可见); 不能拦截期直接写 user/message(恒处于
+//       tool_calls/tool_result 窗口, 0.9.4 INVALID_REQUEST 回归), 也不入队 pendingNotices
+//       (那要等响应后的 post-execute)。响应后的 ✅/❌ 仍走入队 + post-execute flush 原路径;
+//       inbox 不可用时 ⏳ 退回入队兜底。
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -706,13 +713,21 @@ try {
   checks['审批后任务继续并完成'] = apprDone?.status === 'done'
     && agentsById.get(String(apprDone?.result?.sessionId))?.approvalOutcome === 'allowed-once'
 
-  // 【2】web UI 提示(安全落点, 回归修复): 拦截只入队不写日志; 工具完成后经 tools/post-execute 把
-  // notice 并入 additionalContexts, 由 agent-loop 在 tool/result 之后追加 —— 断言拦截期日志未被
-  // 污染, 且落点后的模型消息序列满足「assistant 带 tool_calls 后必须紧跟对应 tool/result」约束(无 INVALID_REQUEST)。
+  // 【2+3】web UI 提示: ⏳ 接管提示拦截当下即时追加到 agent 的 next-step inbox(user 形状,
+  // web UI 挂起期立即可见, 见增量17); 拦截/响应期仍绝不直接写会话日志(0.9.4 序列回归)。
+  // ✅ 响应提示保持入队, 工具完成后经 tools/post-execute 并入 additionalContexts, 由 agent-loop
+  // 在 tool/result 之后追加 —— 落点后的模型消息序列满足「assistant 带 tool_calls 后必须紧跟
+  // 对应 tool/result」约束(无 INVALID_REQUEST)。
   const apprAgent = agentsById.get(String(apprDone?.result?.sessionId))
   const apprLog = apprAgent?.session.log ?? []
   const apprNoticesAtIntercept = apprLog.filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
-  checks['notice: 审批拦截/响应只入队, 不污染会话日志'] = apprNoticesAtIntercept.length === 0
+  checks['notice: 审批拦截/响应期不写会话日志(即时投递只走 inbox)'] = apprNoticesAtIntercept.length === 0
+  {
+    const steer = inboxAppends.filter((x) => x.t === 'next-step' && String(x.m?.content?.[0]?.text ?? '').includes('⏳ 审批已由 MCP 接管'))
+    checks['notice: ⏳ 接管提示拦截期即时入 inbox(next-step)'] = steer.length >= 1
+    checks['notice: ⏳ 即时提示为 user 形状(web UI steering 投影前提)'] = steer.every((x) => x.m?.source?.kind === 'user' && x.m?.role === 'user')
+      && steer.some((x) => String(x.m?.content?.[0]?.text ?? '').includes(`prompt ${apprList.prompts.find((p) => p.type === 'approval').id}`))
+  }
   // 模拟 harness 循环提交该 step 的日志形状(assistant 带 tool-call → tool/call → tool/result)
   appendStep(apprLog, { type: 'assistant/message', data: { turn: 1, step: 1, message: makeAssistantWithToolCall('c-1', 'bash') } })
   appendStep(apprLog, { type: 'tool/call', data: { turn: 1, step: 1, callId: 'c-1', name: 'bash', arguments: '{}' } })
@@ -728,14 +743,14 @@ try {
   // 下个 step 开始时追加为 user/message(落点在 tool/result 之后)
   for (const msg of apprFlushed) appendStep(apprLog, { type: 'user/message', data: msg })
   const apprNoticeIdx = apprLog.findIndex((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
-  checks['notice: 审批提示在 tool/result 之后安全落点'] = apprFlushed.length === 2 && apprNoticeIdx > apprToolResultIdx
+  // ⏳ 已改走即时 inbox 投递, flush 只承接 ✅ 响应提示(数量 1)
+  checks['notice: ✅ 响应提示在 tool/result 之后安全落点'] = apprFlushed.length === 1 && apprNoticeIdx > apprToolResultIdx
   checks['notice: 追加后模型消息序列合法(无 INVALID_REQUEST)'] = modelSequenceError(apprLog) === null
   // 增量16: notice 原生呈现契约 —— form:'notice' 在 additionalContexts 路径上被保留(web UI 的
   // contextForm → KNOWN_FORMS 含 'notice', 走 NoticeBody 专属呈现), 折叠行 summary 必须非空;
-  // 文案为 ⏳/✅ 系统状态措辞(「审批已由 MCP 接管/响应」), 而非底层调用叫法
-  checks['notice: 原生 notice 呈现契约(form:notice + summary 非空)'] = apprFlushed.length === 2
+  // ✅ 文案为系统状态措辞(「审批已由 MCP 响应」); ⏳ 文案已由上面的 inbox 检查承接
+  checks['notice: 原生 notice 呈现契约(form:notice + summary 非空)'] = apprFlushed.length === 1
     && apprFlushed.every((m) => m?.source?.form === 'notice' && typeof m.source.summary === 'string' && m.source.summary.length > 0)
-    && apprFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('⏳ 审批已由 MCP 接管'))
     && apprFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('✅ 审批') && String(m.content?.[0]?.text ?? '').includes('已由 MCP 侧响应'))
   // 反向控制: 旧版错误插入(user/message 插在 assistant(tool_calls) 与 tool/result 之间)必须被校验器检出
   {
@@ -763,10 +778,16 @@ try {
   checks['prompt_respond: 提问自由文本回答'] = innerOf(respQ).ok === true
   const qAnswer = await askPromise
   checks['提问 provider 收到回答'] = qAnswer.answers?.[0]?.custom === 'pg'
-  // 【2】提问 notice(安全落点): 拦截只入队; 工具完成后统一经 tools/post-execute 落点
+  // 【2+3】提问 notice: ⏳ 接管提示拦截当下即时入 inbox(user 形状); ✅ 回答提示入队,
+  // 工具完成后统一经 tools/post-execute 落点
   const qLog = qAgent?.session.log ?? []
   const qNoticesAtIntercept = qLog.filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
   checks['提问 notice: 拦截期不写日志'] = qNoticesAtIntercept.length === 0
+  {
+    const qSteer = inboxAppends.filter((x) => x.t === 'next-step' && String(x.m?.content?.[0]?.text ?? '').includes('⏳ 提问已由 MCP 接管'))
+    checks['提问 notice: ⏳ 接管提示拦截期即时入 inbox(next-step, user 形状)'] = qSteer.length >= 1
+      && qSteer.every((x) => x.m?.source?.kind === 'user' && x.m?.role === 'user')
+  }
   appendStep(qLog, { type: 'assistant/message', data: { turn: 1, step: 1, message: makeAssistantWithToolCall('q-c1', 'ask_user_question') } })
   appendStep(qLog, { type: 'tool/call', data: { turn: 1, step: 1, callId: 'q-c1', name: 'ask_user_question', arguments: '{}' } })
   appendStep(qLog, { type: 'tool/result', data: { turn: 1, step: 1, message: makeToolResult('q-c1', 'answered') } })
@@ -778,9 +799,9 @@ try {
   const qFlushed = (qDecision.additionalContexts ?? []).filter((m) => m?.source?.form === 'notice')
   for (const msg of qFlushed) appendStep(qLog, { type: 'user/message', data: msg })
   const qNoticeIdx = qLog.findIndex((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
-  checks['提问 notice: 在 tool/result 之后安全落点'] = qFlushed.length === 2 && qNoticeIdx > qToolResultIdx
-  checks['提问 notice: 含接管/回答提示且序列合法(无 INVALID_REQUEST)'] = qFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('⏳ 提问已由 MCP 接管'))
-    && qFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('已由 MCP 侧回答'))
+  // ⏳ 已改走即时 inbox 投递, flush 只承接 ✅ 回答提示(数量 1)
+  checks['提问 notice: ✅ 回答提示在 tool/result 之后安全落点'] = qFlushed.length === 1 && qNoticeIdx > qToolResultIdx
+  checks['提问 notice: 落点后序列合法(无 INVALID_REQUEST), ⏳ 已由 inbox 检查承接'] = qFlushed.some((m) => String(m.content?.[0]?.text ?? '').includes('已由 MCP 侧回答'))
     && modelSequenceError(qLog) === null
 
   // ── 增量13: 模型/执行失败反映到任务结果 + 切模型 + 注入 ──

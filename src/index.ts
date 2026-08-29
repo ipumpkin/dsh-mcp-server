@@ -84,7 +84,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.9.8"
+export const VERSION = "0.9.10"
 
 /**
  * 声明依赖的核心服务。
@@ -716,8 +716,14 @@ interface PendingQuestion {
   reject: (e: Error) => void
 }
 
-/** MCP 驱动的会话 id 集(创建/接管即标记): 审批应答者只认领这些会话的审批, 其余交给 web GUI 应答链 */
+/** MCP 驱动的会话 id 集(创建/接管即标记): 标识「该会话由 MCP 创建或接管过」(历史事实, 不随任务结束消失) */
 const mcpSessionIds = new Set<string>()
+/** 当前有 MCP 任务正在执行的会话 id 集(mcpBusySessionIds ⊆ mcpSessionIds): 这是「会话当前是否有 MCP
+ *  活跃任务」(正被 agent_run / task_inbox 驱动)的精确判据 —— executeTask 里 getAgent 成功返回后标记,
+ *  任务结束(成功/超时/取消/异常统一汇聚到 return result 前的落点)清除。审批应答者必须同时满足
+ *  「在 mcpSessionIds 且在 mcpBusySessionIds」才接管: 单看 mcpSessionIds 只能证明历史接管过, 用户经
+ *  web UI 直接向该会话发消息触发的审批也会被误接管, 而 Hermes 并无任务在等 → 两端都收不到, 死锁。 */
+const mcpBusySessionIds = new Set<string>()
 /** 审批决策结果(DSH 词汇表的调用方可控子集; 'unavailable' 仅由 fail-closed 产生) */
 type ApprovalOutcomeValue = 'allowed-once' | 'rejected' | 'cancelled'
 /** ctx.approval 'approval/request' 请求的只读视图(鸭子类型, 避免引入 dsh-user-approval 依赖) */
@@ -975,11 +981,13 @@ interface PendingNotice {
 }
 
 /**
- * 按 agent id 挂起的 notice 队列: 拦截时只入队, 绝不直接写会话日志。
+ * 按 agent id 挂起的 notice 队列: 响应类提示(✅/❌)只入队, 绝不直接写会话日志。
  * 修复回归: 旧版 appendPromptNotice 在 approval/request 拦截期直接 append user/message,
  * 若时机落在 assistant 带 tool_calls 的消息与其 tool/result 之间, 会打断消息序列,
  * 使下个模型请求报 'An assistant message with tool_calls must be followed by tool
  * messages responding to each tool_call_id'(INVALID_REQUEST), 会话失效。
+ * (拦截类 ⏳ 提示现已走 notifyPromptIntercepted 的挂起期即时投递, 不再经过本队列;
+ * 本队列仍承接 ✅/❌ 响应提示, 并作为 ⏳ 即时投递失败时的兜底。)
  */
 const pendingNotices = new Map<string, PendingNotice[]>()
 
@@ -1044,6 +1052,51 @@ function flushPromptNotices(agent: unknown, downstream: { kind?: string; additio
   return { ...downstream, additionalContexts: [...(downstream.additionalContexts ?? []), ...contexts] }
 }
 
+/**
+ * 【3】挂起期即时投递: 审批/提问被 MCP 拦截的 ⏳ 提示, 拦截当下立即追加到该 agent 的
+ * next-step inbox, 让 web UI 在用户响应(prompt_respond)之前就能看到, 不再等响应后才随
+ * tools/post-execute flush 落地。
+ *
+ * 落点选型(对照 DSH 0.1.1-rc.2 核心源码逐一实证; 两份候选方案均被否决, 理由如下):
+ *  - 方案A-2(拦截期直接 session.append user/message)被否决 —— 拦截时机恒处于
+ *    「assistant(tool_calls) 已落日志、其 tool/result 未回」窗口: dsh-agent-loop 的 startCall
+ *    先 appendToolCall 再 prepare/dispatch, 而 approval/request 在工具执行内触发
+ *    (dsh-tools resolveAskDecision → approval.request → approval/request waterfall)。
+ *    此窗口内直插 user/message 会进入 surface(deriveMessages 按日志序投影), 下个模型请求即报
+ *    INVALID_REQUEST(0.9.4 回归)。因此「窗口判断」在拦截回调里恒为不安全, 直接 append 无一例外。
+ *  - 方案A-1(inbox.append('next-step', form:'notice' 插件消息))消息序列安全, 但挂起期不可见:
+ *    inbox 只在下一个 step 边界被消费(dsh-agent-loop preStep → inbox.claim), 且宿主
+ *    dsh-host-apiproxy 的 queueItems 投影只把 source.kind === 'user' 的 next-step 项标为
+ *    placement 'steering', 其余(含 plugin 来源)标为 'context' —— 而 web UI 对 placement
+ *    'context' 的队列行没有任何渲染(只渲染 'steering' → PendingSteeringBubble、
+ *    'queued' → QueueDock), form:'notice' 的折叠行要等 claim 落日志后才出现,
+ *    与现有 flush 路径同时机, 等于白做。
+ *  - 实际采用: inbox.append('next-step', source { kind: 'user' }) —— 即 web GUI「steering」
+ *    的官方同款形状: 宿主在 agent/inbox/spliced 事件上即时 broadcast session/queue
+ *    (placement 'steering'), web UI 当场渲染 PendingSteeringBubble(挂起期立即可见);
+ *    用户响应后 agent-loop 在下个 step 边界 claim 该消息, 追加为 user/message —— 落点在
+ *    全部 tool/result 之后(与官方 steering 消息同位), 模型消息序列合法; UI 气泡随 durable
+ *    user/message 落地而退役为 transcript 内的 steering 行。对模型而言与现有 flush 路径
+ *    完全同位同角色(user-role 文本, 下一步边界送达), 不新增模型语义。
+ *
+ * inbox 不可用/append 抛错时退回 queuePromptNotice(挂起 pendingNotices, 仍由
+ * tools/post-execute 统一 flush), 原有兜底机制保持不变。响应后的 ✅/❌ 提示不走本函数:
+ * settle 时同样处于 tool/result 未回窗口(直接写日志同样非法), 且 ✅ 没有「挂起期」诉求,
+ * 维持既有入队 + flush 路径。
+ */
+function notifyPromptIntercepted(agent: unknown, text: string, summary: string): void {
+  const inbox = (agent as { inbox?: { append?: (t: 'next-turn' | 'next-step', m: unknown) => void } } | undefined)?.inbox
+  if (inbox?.append) {
+    try {
+      inbox.append('next-step', createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }) as never)
+      return
+    } catch (e) {
+      console.warn('[harness-mcp-server] prompt steering append failed, falling back to queued notice:', (e as Error)?.message ?? String(e))
+    }
+  }
+  queuePromptNotice(agent, text, summary)
+}
+
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
  *  opts.onAgent 在 agent 就绪后回调一次, 供 task_cancel 注册打断钩子;
  *  opts.fresh = true 且未传 sessionId 时强制全新会话(跳过池复用, 见 getAgent);
@@ -1089,6 +1142,9 @@ async function executeTask(
       ctx, workdir, resumeSessionId, effectiveTitle, opts?.fresh || (modeRequested && resumeSessionId === undefined),
       { provider: opts?.provider, model: opts?.model }, opts?.mode,
     )
+    // 标记「该会话当前有 MCP 任务在跑」(审批接管判据): 任务结束(成功/超时/取消/异常统一汇聚到
+    // return result 前的落点)立即清除, 避免残留导致后续 web UI 直发消息触发的审批被误接管。
+    mcpBusySessionIds.add(String(sessionId))
     const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
 
     // 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求
@@ -1269,6 +1325,10 @@ async function executeTask(
         /* 释放失败不影响结果 */
       }
     }
+
+    // 任务结束统一落点(正常/超时/取消/错误都汇聚到这里): 不论成功/超时/取消/异常都清除
+    // 「MCP 任务在跑」标记 —— 残留会让审批应答者误以为仍有 MCP 活跃任务而错误接管。
+    mcpBusySessionIds.delete(String(sessionId))
 
     return result
   })
@@ -1783,6 +1843,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         return out(JSON.stringify({
           status: 'async',
           taskId: id,
+          // 实际会话 id(onAgent 就绪后回填; 任务仍在等锁时可能缺省): 转异步后调用方凭它跟进
+          // waiting_input 的审批/提问(prompt_respond)或 session_read 审计, 无需绕道 task_list
+          ...(item.sessionId !== undefined ? { sessionId: item.sessionId } : {}),
           progress: await taskProgressOf(ctx, item),
           note: `task still running after ${waitMs}ms; poll via task_result / task_wait, or cancel via task_cancel`,
         }, null, 2))
@@ -1889,8 +1952,15 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           item.finishedAt = Date.now()
         }
       })()
-      // 队列已接收: context 恒 null(任务未开始, 无会话可测); 执行中/结束后的占用经 task_result/task_wait/task_list 读取
-      return out(JSON.stringify({ taskId: id, status: 'queued', context: null }))
+      // 队列已接收: context 恒 null(任务未开始, 无会话可测); 执行中/结束后的占用经 task_result/task_wait/task_list 读取。
+      // sessionId 仅当调用方显式传入时回显(此时是「请求续接的会话」); 未传时实际会话由执行期 getAgent
+      // 决定(池复用/新建), 待 agent 就绪后经 task_result/task_list 的 sessionId 字段可见。
+      return out(JSON.stringify({
+        taskId: id,
+        status: 'queued',
+        ...(item.sessionId !== undefined ? { sessionId: item.sessionId } : {}),
+        context: null,
+      }))
     },
   )
 
@@ -1904,6 +1974,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       if (!item) return err(JSON.stringify({ error: `task not found: ${taskId}` }))
       return out(JSON.stringify({
         taskId: item.id,
+        // 实际会话 id(onAgent 就绪后回填, 池复用/新建时可能 ≠ 传入的 resume id; 未就绪时省略):
+        // waiting_input 时与 progress.prompts 的 promptId 配对直调 prompt_respond, 无需绕道 task_list
+        sessionId: item.sessionId,
         status: item.status,
         error: item.error,
         cancelled: item.cancelled === true || undefined,
@@ -1935,6 +2008,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       }
       return out(JSON.stringify({
         taskId: item.id,
+        // 实际会话 id(onAgent 就绪后回填, 池复用/新建时可能 ≠ 传入的 resume id; 未就绪时省略):
+        // waiting_input 时与 progress.prompts 的 promptId 配对直调 prompt_respond, 无需绕道 task_list
+        sessionId: item.sessionId,
         status: item.status,
         error: item.error,
         cancelled: item.cancelled === true || undefined,
@@ -1993,20 +2069,21 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       const item = taskQueue.get(taskId)
       if (!item) return err(JSON.stringify({ error: `task not found: ${taskId}` }))
       if (item.status === 'done' || item.status === 'error') {
-        return out(JSON.stringify({ taskId, status: item.status, cancelled: false, note: 'already finished' }))
+        return out(JSON.stringify({ taskId, sessionId: item.sessionId, status: item.status, cancelled: false, note: 'already finished' }))
       }
       const cancel = taskCancelHooks.get(taskId)
       if (!cancel) {
         // agent 未就绪(等锁/排队中): 置 cancelled 标记, executeTask 在锁释放后执行前检查并中止
         item.cancelled = true
-        return out(JSON.stringify({ taskId, status: item.status, cancelled: true, note: 'cancel requested before agent started; will abort on start' }))
+        // sessionId 未就绪时为 undefined(JSON 序列化自动省略)
+        return out(JSON.stringify({ taskId, sessionId: item.sessionId, status: item.status, cancelled: true, note: 'cancel requested before agent started; will abort on start' }))
       }
       try {
         await cancel()
       } catch (e) {
         return err(JSON.stringify({ error: `cancel failed: ${(e as Error)?.message ?? String(e)}` }))
       }
-      return out(JSON.stringify({ taskId, status: item.status, cancelled: true }))
+      return out(JSON.stringify({ taskId, sessionId: item.sessionId, status: item.status, cancelled: true }))
     },
   )
 
@@ -2396,14 +2473,19 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const host = config.host ?? '127.0.0.1'
   console.log('[harness-mcp-server] apply called, port=', port)
 
-  // ── 审批应答者: MCP 会话的审批弹窗一律转达调用方, 绝不自动放行 ──
-  // prepend 抢在 web GUI 应答者之前认领 MCP 会话的审批; 非 MCP 会话 next() 交给 GUI 应答链。
+  // ── 审批应答者: 正被 MCP 任务驱动的会话, 审批一律转达调用方, 绝不自动放行 ──
+  // prepend 抢在 web GUI 应答者之前认领审批; 仅当会话属 MCP(mcpSessionIds)且此刻正被 MCP 任务驱动
+  // (mcpBusySessionIds: 当前有 agent_run/task_inbox 在跑)才接管转达调用方(Hermes);
+  // 否则(例如用户经 web UI 直接向 MCP 创建过的会话发消息、此刻没有 MCP 任务在跑)不接管,
+  // next() 交给 web GUI 应答链 —— 避免接管后 Hermes 调用方不知情/无法响应、web UI 也弹不出
+  // 审批窗的双端死锁(旧版只看 mcpSessionIds 的死锁根因)。
   // approve → 'allowed-once'(一次性授权), deny → 'rejected', 任务取消/超时 → signal abort → 'cancelled'。
   const onApprovalRequest = (req: ApprovalRequestView, next: () => Promise<string>): Promise<string> => {
     if (req.signal?.aborted) return Promise.resolve('cancelled')
     // 防御: agent.id 为权威; 个别实现只挂 session.id 时兜底
     const agentId = String(req.agent.id ?? (req.agent.session as { id?: unknown } | undefined)?.id)
-    if (!mcpSessionIds.has(agentId)) return next()
+    // 仅当会话属 MCP 且正被 MCP 任务驱动才接管转达调用方; 否则交给 web GUI 应答链
+    if (!mcpSessionIds.has(agentId) || !mcpBusySessionIds.has(agentId)) return next()
     const promptId = approvalPromptIdOf(req)
     return new Promise<string>((resolve) => {
       let settled = false
@@ -2420,8 +2502,11 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       const onAbort = () => settle('cancelled')
       pendingApprovals.set(promptId, { promptId, agentId, toolName: req.toolName, reason: req.reason, resolve: settle })
       req.signal?.addEventListener('abort', onAbort, { once: true })
-      // 【2】web UI 提示(入队, 工具完成后安全落点): 该审批已被 MCP 拦截接管
-      queuePromptNotice(
+      // 【2+3】web UI 提示: 该审批已被 MCP 拦截接管。⏳ 接管提示走挂起期即时投递
+      // (notifyPromptIntercepted: next-step inbox 即时追加, web UI 挂起期立刻可见);
+      // 不能在拦截期直接写 user/message(恒处于 tool_calls/tool_result 窗口, 0.9.4 回归),
+      // 也不入队 pendingNotices(那要等响应后的 post-execute 才落地, 挂起期无提示)。
+      notifyPromptIntercepted(
         req.agent,
         `⏳ 审批已由 MCP 接管（${req.toolName}${req.reason !== undefined ? `：${req.reason}` : ''}），等待 Hermes/客户端响应（prompt ${promptId}）`,
         `⏳ 审批已由 MCP 接管：${req.toolName}`,
@@ -2434,7 +2519,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     { prepend: true },
   )
 
-  // ── notice 安全投递: 审批/提问拦截只入队, 工具完成( tools/post-execute )后并入 additionalContexts ──
+  // ── notice 安全投递: 响应类提示(✅/❌)与即时投递兜底只入队, 工具完成( tools/post-execute )后并入 additionalContexts ──
   // agent-loop 在 appendToolResult 之后把 additionalContexts splice 进 next-step inbox,
   // 下个 step 开始时才追加为 user/message —— 从不在 assistant(tool_calls) 与其 tool/result 之间
   // 插入消息(修复 0.9.4 起 notice 打断消息序列导致 INVALID_REQUEST 的回归)。
@@ -2490,10 +2575,11 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
               }),
             })
             r.signal?.addEventListener('abort', onAbort, { once: true })
-            // 【2】web UI 提示(入队, 工具完成后安全落点): 该提问已被 MCP 拦截接管
+            // 【2+3】web UI 提示: 该提问已被 MCP 拦截接管 —— ⏳ 走挂起期即时投递
+            // (notifyPromptIntercepted, 同审批; 拦截期不可直接写 user/message, 见该函数注释)
             if (r.agent !== undefined) {
               const first = r.questions[0]
-              queuePromptNotice(r.agent, `⏳ 提问已由 MCP 接管（${first?.question ?? '…'}），等待 Hermes/客户端响应（prompt ${promptId}）`, '⏳ 提问已由 MCP 接管')
+              notifyPromptIntercepted(r.agent, `⏳ 提问已由 MCP 接管（${first?.question ?? '…'}），等待 Hermes/客户端响应（prompt ${promptId}）`, '⏳ 提问已由 MCP 接管')
             }
           })
         },
@@ -2598,6 +2684,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       taskQueue.clear()
       taskCancelHooks.clear()
       mcpSessionIds.clear()
+      mcpBusySessionIds.clear()
       sessionModelOverrides.clear()
       pendingNotices.clear()
       for (const pa of pendingApprovals.values()) pa.resolve('cancelled')
