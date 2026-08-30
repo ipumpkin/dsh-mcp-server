@@ -6,9 +6,10 @@
       config:
         http: true
         port: 8090
-        host: 127.0.0.1        # 默认仅本机; 暴露公网前必须加认证(authToken)+反代+TLS
+        host: 127.0.0.1        # 默认仅本机; 全网卡监听改 '0.0.0.0'(必须同时配 token, 见下)
         # taskTimeoutMs: 3600000   # 可选: 单任务超时毫秒数(默认 60 分钟, 0 = 不限制)
-        # authToken: 'your-secret-token'     # 可选: Bearer token 认证(设置后所有请求必须带)
+        # authToken: 'your-secret-token'     # 可选: Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>)
+        # authTokens: ['token-a', 'token-b'] # 可选: 多 token(任一命中放行; 与 authToken 并存, 多客户端各持一个)
         # workspaceRoots: ['/workspace']      # 可选: cwd 白名单(防路径穿越)
         # preset: 'standard'                  # 可选: setup 挂载的 agent preset
         # maxAgents: 8                        # 可选: 常驻 agent 会话上限(LRU 淘汰)

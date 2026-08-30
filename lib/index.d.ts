@@ -63,7 +63,7 @@ import type { Context } from '@deepseek-ai/cordis';
 /** Cordis 插件名 */
 export declare const name = "harness-mcp-server";
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export declare const VERSION = "0.9.10";
+export declare const VERSION = "0.10.3";
 /**
  * 声明依赖的核心服务。
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——
@@ -91,6 +91,8 @@ export interface Config {
     taskTimeoutMs?: number;
     /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
     authToken?: string;
+    /** Bearer token 列表(任一命中即放行; 与 authToken 并存, 适合多客户端各自持一个 token) */
+    authTokens?: string[];
     /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
     workspaceRoots?: string[];
 }

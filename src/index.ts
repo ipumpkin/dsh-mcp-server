@@ -75,7 +75,9 @@ import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+import schemastery from '@deepseek-ai/schemastery'
 import { realpath } from 'node:fs/promises'
 import http from 'node:http'
 import { resolve } from 'node:path'
@@ -84,7 +86,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.9.10"
+export const VERSION = "0.10.3"
 
 /**
  * 声明依赖的核心服务。
@@ -114,6 +116,8 @@ export interface Config {
   taskTimeoutMs?: number
   /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
   authToken?: string
+  /** Bearer token 列表(任一命中即放行; 与 authToken 并存, 适合多客户端各自持一个 token) */
+  authTokens?: string[]
   /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
   workspaceRoots?: string[]
 }
@@ -129,7 +133,66 @@ const runtimeConfig = {
   maxAgents: 8,
   taskTimeoutMs: 60 * 60 * 1000,
   authToken: '',
+  authTokens: [] as string[],
   workspaceRoots: [] as string[],
+}
+
+/**
+ * Bearer token 校验(常时时间比较, 防时序侧信道逐字节猜 token)。
+ * 有效 token 集 = authToken + authTokens; 空集 = 未启用认证(直接放行)。
+ * header 须为 `Bearer <token>`; timingSafeEqual 要求等长输入,
+ * 先比长度(长度不同直接 false, 不泄漏 token 内容), 等长才进常时比较。
+ */
+function bearerTokenOk(header: string | undefined): boolean {
+  const tokens = [
+    ...(runtimeConfig.authToken ? [runtimeConfig.authToken] : []),
+    ...runtimeConfig.authTokens,
+  ]
+  if (tokens.length === 0) return true
+  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false
+  const given = Buffer.from(header.slice('Bearer '.length), 'utf8')
+  return tokens.some((t) => {
+    const expected = Buffer.from(t, 'utf8')
+    return expected.length === given.length && timingSafeEqual(expected, given)
+  })
+}
+
+// ── settings 命名空间: web 设置面板可配置的持久化子集(生效值 = schema 默认 → 入口 config base → 用户层) ──
+
+/** settings 命名空间名(web 设置卡片以它为键配对) */
+const SETTINGS_NAMESPACE = 'harness-mcp-server'
+
+/** 设置界面可编辑的持久化字段(入口 config 里 taskTimeoutMs 等其余字段不进 settings) */
+interface HarnessMcpSettings {
+  host: string
+  port: number
+  authToken: string
+}
+
+/** schemastery schema: 也是设置面板渲染与 wire 校验的依据 */
+const HarnessMcpSettingsSchema = schemastery.object({
+  host: schemastery.string().default('127.0.0.1'),
+  port: schemastery.number().default(8090),
+  authToken: schemastery.string().default(''),
+})
+
+/** ctx.settings 的结构化最小面(避免绑定宿主具体实现类型) */
+interface SettingsProviderLike {
+  register(
+    ns: ReturnType<typeof settingsNamespace>,
+    schema: unknown,
+    options?: {
+      base?: Partial<HarnessMcpSettings>
+      applies?: 'live' | 'restart'
+      validate?: (value: HarnessMcpSettings) => void
+    },
+  ): SettingsScopeLike
+}
+
+/** register 返回的命名空间 scope 的结构化最小面 */
+interface SettingsScopeLike {
+  get(): HarnessMcpSettings
+  watch(callback: (next: HarnessMcpSettings, prev: HarnessMcpSettings) => void | Promise<void>): () => void
 }
 
 // ── 会话「模式」词汇: agent 预设 + 沙箱访问模式 + 审批策略 ──
@@ -2466,12 +2529,14 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
   if (config.taskTimeoutMs !== undefined) runtimeConfig.taskTimeoutMs = config.taskTimeoutMs
   if (config.authToken) runtimeConfig.authToken = config.authToken
+  if (config.authTokens?.length) runtimeConfig.authTokens = [...config.authTokens]
   if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
 
-  const port = config.port ?? 8090
+  // 生效监听配置: 入口 config 引导; 有 settings 服务时被用户层(设置界面)覆盖, 见下方注册段
+  let effectiveHost = config.host ?? '127.0.0.1'
+  let effectivePort = config.port ?? 8090
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
-  const host = config.host ?? '127.0.0.1'
-  console.log('[harness-mcp-server] apply called, port=', port)
+  console.log('[harness-mcp-server] apply called, port=', effectivePort)
 
   // ── 审批应答者: 正被 MCP 任务驱动的会话, 审批一律转达调用方, 绝不自动放行 ──
   // prepend 抢在 web GUI 应答者之前认领审批; 仅当会话属 MCP(mcpSessionIds)且此刻正被 MCP 任务驱动
@@ -2595,15 +2660,13 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const servers = new Map<string, McpServer>()
   const transports = new Map<string, StreamableHTTPServerTransport>()
 
-  const server = http.createServer(async (req, res) => {
-    // Bearer token 认证(配置了 authToken 时强制所有请求校验)
-    if (runtimeConfig.authToken) {
-      const auth = req.headers['authorization']
-      if (auth !== `Bearer ${runtimeConfig.authToken}`) {
-        res.writeHead(401, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null }))
-        return
-      }
+  // ── HTTP 请求处理(单一实例跨重绑复用: server.close() 后 listen 新地址) ──
+  const handleHttpRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
+    // Bearer token 认证(配置了 authToken/authTokens 任一即强制全请求校验; 常时时间比较防时序侧信道)
+    if (!bearerTokenOk(req.headers['authorization'])) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null }))
+      return
     }
     const sessionId = (req.headers['mcp-session-id'] as string | undefined) ?? undefined
     const existing = sessionId ? transports.get(sessionId) : undefined
@@ -2653,14 +2716,73 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     // 无 session 的非初始化请求 → 400
     res.writeHead(400, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32600, message: 'Invalid request' }, id: null }))
-  })
+  }
 
-  server.listen(port, host, () => {
-    console.log(`[harness-mcp-server] MCP server listening on ${host}:${port}`)
-  })
+  const server = http.createServer(handleHttpRequest)
   server.on('error', (e) => {
     console.error('[harness-mcp-server] HTTP server error:', e.message)
   })
+  // 初始监听: 入口 config 引导值; settings 注册回调随后用解析值校正(必要时重绑)
+  server.listen(effectivePort, effectiveHost, () => {
+    const tokenCount = (runtimeConfig.authToken ? 1 : 0) + runtimeConfig.authTokens.length
+    console.log(`[harness-mcp-server] MCP server listening on ${effectiveHost}:${effectivePort} (auth: ${tokenCount > 0 ? `on, ${tokenCount} token(s)` : 'OFF'})`)
+  })
+
+  /**
+   * 按生效配置重绑监听(settings 界面改 host/port 时热生效):
+   * 关旧监听 → 新 listen; transports/servers 映射不动, 已建立 MCP 会话跨重绑存活。
+   * 新 listen 失败(EADDRINUSE 等)仅大声告警 —— 旧实例已关, 设置文档保留坏值待用户修正。
+   */
+  const rebind = (host: string, port: number): void => {
+    server.close()
+    server.listen(port, host, () => {
+      const tokenCount = (runtimeConfig.authToken ? 1 : 0) + runtimeConfig.authTokens.length
+      console.log(`[harness-mcp-server] MCP server listening on ${host}:${port} (auth: ${tokenCount > 0 ? `on, ${tokenCount} token(s)` : 'OFF'})`)
+      // 非环回监听 = 暴露到局域网/公网, 未配 token 时大声告警(不阻断启动, 交给部署者决断)
+      if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1' && tokenCount === 0) {
+        console.warn(`[harness-mcp-server] ⚠️ WARNING: listening on ${host} (non-loopback) with NO auth token — anyone on the network can call this MCP server. Set authToken/authTokens in config or the settings UI.`)
+      }
+    })
+  }
+
+  /** 应用生效配置: token 集合即时生效; host/port 变化才重绑(避免无谓的监听重启)。 */
+  const applyEffective = (next: { host: string; port: number; authToken: string }): void => {
+    runtimeConfig.authToken = next.authToken
+    const rebindNeeded = next.host !== effectiveHost || next.port !== effectivePort
+    effectiveHost = next.host
+    effectivePort = next.port
+    if (rebindNeeded) rebind(next.host, next.port)
+  }
+
+  // ── settings 命名空间注册: web 设置面板「插件配置」卡片的宿主半区 ──
+  // 入口 config 作为组合层 base(用户层未覆盖时的值); 用户经设置界面写入的值落在用户层并即时生效。
+  // 无 settings 服务的部署(headless 等)回调不触发, 保持纯入口配置行为。
+  if (typeof ctx.inject === 'function') {
+    ;(ctx.inject as unknown as (names: string[], cb: (settingsCtx: { settings: SettingsProviderLike }) => void) => unknown)(
+      ['settings'],
+      (settingsCtx: { settings: SettingsProviderLike }) => {
+    const scope = settingsCtx.settings.register(
+      settingsNamespace(SETTINGS_NAMESPACE),
+      HarnessMcpSettingsSchema,
+      {
+        base: {
+          ...(config.host !== undefined ? { host: config.host } : {}),
+          ...(config.port !== undefined ? { port: config.port } : {}),
+          ...(config.authToken !== undefined ? { authToken: config.authToken } : {}),
+        },
+        applies: 'live',
+        validate: (v) => {
+          if (!v.host || v.host.trim() === '') throw new Error('host 不能为空')
+          if (!Number.isInteger(v.port) || v.port < 1 || v.port > 65535) throw new Error('port 必须是 1-65535 的整数')
+          if (/[\r\n]/.test(v.authToken)) throw new Error('authToken 不能包含换行')
+        },
+      },
+    )
+        applyEffective(scope.get())
+        scope.watch((next) => applyEffective(next))
+      },
+    )
+  }
 
   // 存量捞回: 启动后异步补挂未分组会话, 不阻塞启动; 全程兜底 try/catch 防 unhandled rejection
   void (async () => {
