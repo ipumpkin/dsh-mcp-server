@@ -194,7 +194,7 @@ dsh web --patch ~/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-se
 
 ### 方式 C —— 从源码（旧式 dsh checkout 布局）
 
-把本仓库 clone 到 Harness workspace 的 `packages/mcp/harness-mcp-server/` 下（pnpm workspace 匹配 `packages/*/*`，两级深），然后 `pnpm run build` 构建（独立 `tsc`，不再依赖 tsdown）。
+把本仓库 clone 到 Harness workspace 的 `packages/mcp/harness-mcp-server/` 下（pnpm workspace 匹配 `packages/*/*`，两级深），然后 `pnpm run build` 构建（独立 `tsc`，不再依赖 tsdown）。浏览器半区（仓库根的 `client.js`）是手写的 lazy-CJS 工厂文件，无需构建。
 
 ## 运行
 
@@ -205,7 +205,7 @@ dsh web      # 方式 A 安装后直接启动; 方式 B 记得带 --patch
 
 MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指向 `http://127.0.0.1:8090/mcp` 即可。
 
-> ⚠️ **安全警告**：默认只监听 `127.0.0.1`（本机）。它暴露的是**未鉴权的远程代码执行**能力——在没有加认证、TLS 和反向代理之前，**不要**绑定 `0.0.0.0` 或暴露到公网/局域网。
+> ⚠️ **安全警告**：默认只监听 `127.0.0.1`（本机）且**未启用认证**。它暴露的是**未鉴权的远程代码执行**能力——在启用 token 之前，**不要**绑定 `0.0.0.0` 或暴露到公网/局域网（公网暴露还须加 TLS 和反向代理）。绑定非环回地址且未配 token 时，启动会打大声告警。token 可随时在 web 设置的 **MCP Server** 页开启，或经 `authToken`/`authTokens` 配置。
 
 ### Hermes 客户端配置
 
@@ -213,9 +213,14 @@ MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指
 printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
 ```
 
+启用 token 后，客户端每个请求必须带 `Authorization: Bearer <token>` 头（在 MCP 客户端里配置该 header；Hermes 的 streamable-HTTP 服务支持自定义 header）。
+
 ## 配置
 
-patch 条目的 `config` 全部可选：
+两层配置，按序解析（schema 默认 → 入口 config base → 用户层）：
+
+- **web 设置页**（推荐）：dsh web GUI 的 **设置 → MCP Server**。运行时编辑 `host` / `port` / `authToken`——暂存式表单、逐字段重置回入口配置值、revision 设栅写入。保存即时生效：热重绑监听，不断开已建立的 MCP 会话。
+- **入口配置**（cordis.yml bundle 清单或 `--patch` overlay）：全量键面，含仅入口可配的键（`provider`、`preset`、`maxQueue`、`authTokens`…）。全部可选：
 
 | 键 | 默认 | 含义 |
 |-----|---------|---------|
@@ -229,8 +234,11 @@ patch 条目的 `config` 全部可选：
 | `taskTtlMs` | `3600000` | 已完成任务在队列中的保留时长（60 分钟，与 taskTimeoutMs 对齐） |
 | `maxAgents` | `8` | 常驻 agent 池上限（LRU 淘汰） |
 | `taskTimeoutMs` | `3600000` | 单任务超时；超时自动 cancel 并回收部分结果（60 分钟，`0` 关闭） |
-| `authToken` | *(无)* | Bearer token——设置后每个请求必须带 `Authorization: Bearer <token>` |
+| `authToken` | *(无)* | Bearer token——设置后每个请求必须带 `Authorization: Bearer <token>`；也可在设置页管理（显示/隐藏 + 复制） |
+| `authTokens` | *(无)* | 额外 Bearer token 列表（数组，任一命中即放行）——与 `authToken` 并存，适合给每个客户端发独立 token |
 | `workspaceRoots` | *(无)* | cwd 白名单——设置后任务只能在列出的目录下运行（attach_session 的归组目标同样校验） |
+
+> 设置页需要 dsh **web** surface：它经 web settings 文档写入，并以浏览器 bundle 形式分发。没有 settings 服务的 surface（如 headless）宿主半区照常工作，仅缺此页。若宿主行正常但设置导航里始终不出现「MCP Server」页，是部署未解析到浏览器 bundle：把已安装的包链接进宿主安装目录的 `node_modules`（或 `~/.dsh/profiles/node_modules`），例如 `ln -s ~/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server <宿主安装>/node_modules/@chushixixin/dsh-harness-mcp-server`，然后重启。
 
 ### cordis.yml（patch 格式）
 
@@ -243,7 +251,8 @@ patch 条目的 `config` 全部可选：
         port: 8090
         host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
         taskTimeoutMs: 3600000
-        # authToken: 'your-secret-token'     # 可选: Bearer token 认证
+        # authToken: 'your-secret-token'     # 可选: Bearer token 认证(也可在 web 设置页管理)
+        # authTokens: ['token-a', 'token-b']  # 可选: 多 token, 任一命中放行
         # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
 ```
 

@@ -192,7 +192,7 @@ dsh web --patch ~/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-se
 
 ### Option C — from source (legacy dsh checkout layout)
 
-Clone this repo inside your Harness workspace under `packages/mcp/harness-mcp-server/` (the pnpm workspace matches `packages/*/*`, two levels deep), then build with `pnpm run build` (standalone `tsc`, no tsdown needed).
+Clone this repo inside your Harness workspace under `packages/mcp/harness-mcp-server/` (the pnpm workspace matches `packages/*/*`, two levels deep), then build with `pnpm run build` (standalone `tsc`, no tsdown needed). The browser half (`client.js`) is a hand-written lazy-CJS factory file at the repo root and needs no build step.
 
 ## Run
 
@@ -203,7 +203,7 @@ dsh web      # bundle install (Option A) or --patch (Option B) takes effect on b
 
 The MCP server listens on `127.0.0.1:8090` (StreamableHTTP). Point any MCP client at `http://127.0.0.1:8090/mcp`.
 
-> ⚠️ **Security**: by default the server binds to `127.0.0.1` only. It exposes **unauthenticated remote code execution** — do **not** bind it to `0.0.0.0` or expose it to the internet/LAN without adding authentication, TLS, and a reverse proxy first.
+> ⚠️ **Security**: by default the server binds to `127.0.0.1` with **no authentication**, and it exposes **unauthenticated remote code execution** — do **not** bind it to `0.0.0.0` or expose it to the internet/LAN without enabling a token first (plus TLS and a reverse proxy for public exposure). Binding a non-loopback address with no token configured logs a loud warning at startup. A token can be enabled any time from the **MCP Server** settings page (web GUI) or via `authToken`/`authTokens` config.
 
 ### Hermes client config
 
@@ -211,9 +211,14 @@ The MCP server listens on `127.0.0.1:8090` (StreamableHTTP). Point any MCP clien
 printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
 ```
 
+When a token is enabled, the client must send `Authorization: Bearer <token>` on every request (configure the header in your MCP client; e.g. Hermes supports custom headers for streamable-HTTP servers).
+
 ## Config
 
-Patch entries accept `config` (all optional):
+Two layers, resolved in order (schema default → entry-config base → user layer):
+
+- **Web settings page** (recommended): **Settings → MCP Server** in the dsh web GUI. Edits `host` / `port` / `authToken` at runtime — staged form, per-field reset back to the entry-config value, revision-fenced writes. Saving hot-applies: the listener rebinds without dropping established MCP sessions.
+- **Entry config** (cordis.yml bundle manifest or `--patch` overlay): full surface, including entry-only keys (`provider`, `preset`, `maxQueue`, `authTokens`, …). All optional:
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -227,8 +232,11 @@ Patch entries accept `config` (all optional):
 | `taskTtlMs` | `3600000` | How long finished tasks stay in the queue (60 min, aligned with `taskTimeoutMs`) |
 | `maxAgents` | `8` | Resident agent pool cap (LRU eviction) |
 | `taskTimeoutMs` | `3600000` | Per-task timeout; auto-cancel + partial result (60 min, `0` disables) |
-| `authToken` | *(none)* | Bearer token — when set, every request must send `Authorization: Bearer <token>` |
+| `authToken` | *(none)* | Bearer token — when set, every request must send `Authorization: Bearer <token>`; also editable from the settings page (show/hide + copy) |
+| `authTokens` | *(none)* | Additional Bearer tokens (array; any match authorizes) — coexists with `authToken`, handy to give each client its own token |
 | `workspaceRoots` | *(none)* | cwd whitelist — when set, tasks may only run under these directories (`attach_session` targets are validated against it too) |
+
+> The settings page needs the dsh **web** surface: it writes through the web settings document and ships as a browser bundle. On surfaces without the settings service (e.g. headless) the host half works unchanged — only the page is absent. If the host row runs but the page never appears in the web settings nav, the client bundle could not be resolved by the deployment: link the installed package into the host installation's `node_modules` (or `~/.dsh/profiles/node_modules`), e.g. `ln -s ~/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server <host-install>/node_modules/@chushixixin/dsh-harness-mcp-server`, then restart.
 
 ### cordis.yml (patch format)
 
@@ -241,7 +249,8 @@ Patch entries accept `config` (all optional):
         port: 8090
         host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
         taskTimeoutMs: 3600000
-        # authToken: 'your-secret-token'     # 可选: Bearer token 认证
+        # authToken: 'your-secret-token'     # 可选: Bearer token 认证(也可在 web 设置页管理)
+        # authTokens: ['token-a', 'token-b']  # 可选: 多 token, 任一命中放行
         # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
 ```
 
