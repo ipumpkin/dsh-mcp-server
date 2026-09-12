@@ -10,7 +10,15 @@ window.__ModuleLoader__.load({
 		// Host 半区注册 settings 命名空间 'harness-mcp-server'(host/port/authToken),
 		// 本页以独立分区挂进设置导航; 写入经 settings scope(revision 设栅), 保存即热生效。
 		// 暂存式表单: 草稿只在点「保存」时写; 每字段可单独「重置」回组合层(入口 config/patch)。
+		//
+		// dsh 0.1.5 兼容: settingsScope 服务现在由 dsh-client-ui-settings 提供, 且它声明了
+		// inject = ["remote", "remote.settings"] —— 要等 remote 传输层就绪才激活。客户端插件
+		// 若不在 exports.inject 里声明依赖, 会在 boot 早期立即 apply, ctx.get 返回 undefined,
+		// 静默早退后 settings.section 永远注册不上(配置页整页消失)。对齐 dsh-better-sidebar
+		// 的姿势: 声明 inject 让 cordis loader 等服务就绪后再 apply。
 		var NAMESPACE = "harness-mcp-server";
+		/** 客户端半区的硬依赖服务(cordis inject 等待语义; 参考 dsh-better-sidebar exports.inject) */
+		var INJECT = ["settingsScope", "slots"];
 		var PAGE_ORDER = 25;
 		var FIELDS = [
 			{ field: "host", label: "监听地址 (host)", password: false, hint: "127.0.0.1 = 仅本机(默认); 0.0.0.0 = 本机所有网卡(暴露局域网, 建议同时启用 token)" },
@@ -152,7 +160,11 @@ window.__ModuleLoader__.load({
 			};
 
 			if (!ready) {
-				return e("div", { style: { padding: "8px 0", opacity: 0.6 } }, "设置命名空间尚未就绪(等待宿主应答)…");
+				// dsh 0.1.5 快照新增 'unavailable'(命名空间未暴露给当前客户端 / 连接为 memory 模式)
+				var pendingText = snapshot !== undefined && snapshot.status === "unavailable"
+					? "设置命名空间不可用(当前连接未暴露该命名空间或为进程内模式)。"
+					: "设置命名空间尚未就绪(等待宿主应答)…";
+				return e("div", { style: { padding: "8px 0", opacity: 0.6 } }, pendingText);
 			}
 
 			var value = snapshot.value || {};
@@ -258,11 +270,18 @@ window.__ModuleLoader__.load({
 
 		var apply = function (ctx) {
 			// Host 半区注册命名空间后, 浏览器半区经 settingsScope binder 绑定同名 scope
+			// (exports.inject 已声明等待; 这两处守卫只兜服务真缺的异常部署, 告警不留静默)
 			var binder = ctx.get("settingsScope");
-			if (binder === undefined) return;
+			if (binder === undefined) {
+				console.warn("[harness-mcp-server] client: settingsScope service unavailable; settings section not registered");
+				return;
+			}
 			var scope = binder.bind({ namespace: NAMESPACE });
 			var slots = ctx.get("slots");
-			if (slots === undefined) return;
+			if (slots === undefined) {
+				console.warn("[harness-mcp-server] client: slots service unavailable; settings section not registered");
+				return;
+			}
 			// 独立主配置页: 设置导航里的「MCP Server」分区
 			slots.inject("settings.section", function () {
 				slots.register(
@@ -273,6 +292,7 @@ window.__ModuleLoader__.load({
 		};
 
 		exports.apply = apply;
+		exports.inject = INJECT;
 		return module.exports;
 	}
 });

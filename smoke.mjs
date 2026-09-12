@@ -27,6 +27,11 @@
 //       tool_calls/tool_result 窗口, 0.9.4 INVALID_REQUEST 回归), 也不入队 pendingNotices
 //       (那要等响应后的 post-execute)。响应后的 ✅/❌ 仍走入队 + post-execute flush 原路径;
 //       inbox 不可用时 ⏳ 退回入队兜底。
+//   18. 提问应答者换代(dsh 0.1.5 回归修复): 新宿主删除了 registerProvider, 提问改为 Agent 作用域
+//       waterfall 事件 'user-questions/request'。fake userQuestions 只暴露 ask()(0.1.5 形态, 无
+//       registerProvider) —— 验证插件探测到新版走 listener 路径、prepend 抢在 GUI 应答者之前、
+//       MCP 任务期的提问被接管(pending_prompts/prompt_respond 全程可用)、非 MCP 会话的提问
+//       return next() 透传给 GUI; 以及 prompt_respond 对未接管提问的明确指引文案。
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { apply } from './lib/index.js'
@@ -47,15 +52,27 @@ const HANG_CWD2 = resolve(FAKE_CWD, 'hang-zone-2')
 const HANG_CWD3 = resolve(FAKE_CWD, 'hang-zone-3')
 const HANG_CWD4 = resolve(FAKE_CWD, 'hang-zone-4')
 const HANG_SET = new Set([HANG_CWD, HANG_CWD2, HANG_CWD3, HANG_CWD4])
-// 审批弹窗 / 模型失败专用 cwd
+// 审批弹窗 / 提问弹窗 / 模型失败专用 cwd
 const APPROVAL_CWD = resolve(FAKE_CWD, 'approval-zone')
+const QUESTION_CWD = resolve(FAKE_CWD, 'question-zone')
 const ERROR_CWD = resolve(FAKE_CWD, 'error-zone')
 const THROW_CWD = resolve(FAKE_CWD, 'throw-zone')
 
-// 事件注册表 + 用户提问 provider 捕获(prepend 顺序用于验证审批应答者优先级)
+// 事件注册表 + 提问服务 fake(prepend 顺序用于验证应答者优先级)
 const eventHandlers = new Map()
-let capturedProvider
-const fakeUserQuestions = { registerProvider: (p) => { capturedProvider = p; return () => { capturedProvider = undefined } } }
+// dsh-user-questions ≥0.1.5 的服务形态: 只有 ask()(registerProvider 已被删除), ask 内部派发
+// Agent 作用域 waterfall 事件 'user-questions/request'。这里按 cordis waterfall 语义
+// (outermost-first, 不调 next() 即 veto)复刻事件链 —— 与真实 0.1.5 宿主行为一致。
+const NO_ANSWERER = () => Promise.reject(new Error('no user-questions answerer accepted the request'))
+function askUserQuestions(request) {
+  const chain = [...(eventHandlers.get('user-questions/request') ?? [])]
+  const run = async () => {
+    const h = chain.shift()
+    return h ? h(request, run) : NO_ANSWERER()
+  }
+  return run()
+}
+const fakeUserQuestions = { ask: askUserQuestions }
 
 const fakeWs = {
   id: 'ws-fake',
@@ -252,6 +269,29 @@ const ctx = {
         }
         agent.whenIdle = () => new Promise((res) => { settleTurn = res })
       }
+      // 提问弹窗 agent: followup 时模拟 dsh-tool-ask-user → ctx.userQuestions.ask() 派发
+      // 'user-questions/request' waterfall, 等应答链给出答案后落定(答案记在 agent.questionAnswer)
+      if (meta?.cwd === QUESTION_CWD) {
+        let settleTurn
+        agent.followup = () => {
+          if (agent._questionFired) return
+          agent._questionFired = true
+          const ac = new AbortController()
+          const req = {
+            questions: [{ id: 'q1', question: 'Which DB?', options: [{ label: 'pg' }, { label: 'mysql' }] }],
+            agent,
+            signal: ac.signal,
+          }
+          askUserQuestions(req).then((a) => {
+            agent.questionAnswer = a
+            settleTurn?.()
+          }, (e) => {
+            agent.questionError = e
+            settleTurn?.()
+          })
+        }
+        agent.whenIdle = () => new Promise((res) => { settleTurn = res })
+      }
       // 模型失败 agent: followup 写入真实失败形态(turn/end reason.kind='error' + LlmFailure, 对照实测 429 QUOTA 会话)
       if (meta?.cwd === ERROR_CWD) {
         agent.followup = () => {
@@ -395,6 +435,12 @@ try {
   // 模拟 web GUI 的审批应答者: 先注册(在我们的应答者之前), 验证 prepend 抢序 + 非 MCP 会话放行
   const guiHandler = (req, next) => Promise.resolve('gui-claimed')
   ctx.on('approval/request', guiHandler, { prepend: false })
+  // 模拟 web GUI 的提问应答者(≥0.1.5: dsh-client-ui-user-questions 用 ctx.remote.$on 挂同一 waterfall):
+  // 同样先注册, 验证 prepend 抢序 + 非 MCP 会话的提问透传给 GUI
+  const guiQuestionHandler = (request) => Promise.resolve({
+    answers: request.questions.map((q) => ({ id: q.id, selected: [], custom: 'gui-claimed' })),
+  })
+  ctx.on('user-questions/request', guiQuestionHandler, { prepend: false })
 
   await apply(ctx, { port: PORT, host: '127.0.0.1', taskTimeoutMs: 600, workspaceRoots: [FAKE_CWD] })
   await new Promise((r) => setTimeout(r, 400))
@@ -763,23 +809,58 @@ try {
     checks['回归可复现: 旧版插入位置被序列校验器判为 INVALID_REQUEST'] = typeof modelSequenceError(brokenLog) === 'string'
   }
 
-  // 提问流程: 模拟 ask_user_question 走我们持有的 provider → 感知 → prompt_respond answer → 解除阻塞
-  const qAgent = agentsById.get(String(created[4]?.id))
-  const askPromise = capturedProvider.ask({
-    questions: [{ id: 'q1', question: 'Which DB?', options: [{ label: 'pg' }, { label: 'mysql' }] }],
-    agent: qAgent,
-    signal: new AbortController().signal,
-  })
-  await new Promise((r) => setTimeout(r, 100))
-  const ppQ = innerOf(await call(init.sid, 'pending_prompts', { sessionId: String(created[4]?.id) }))
-  const qPrompt = ppQ.prompts.find((p) => p.type === 'question')
-  checks['pending_prompts: 列出提问弹窗(含原文)'] = qPrompt !== undefined && qPrompt.questions?.[0]?.question === 'Which DB?'
-  const respQ = await call(init.sid, 'prompt_respond', { sessionId: String(created[4]?.id), promptId: qPrompt.id, answer: 'pg' })
+  // ── 增量18: 提问应答者换代(dsh-user-questions ≥0.1.5) ──
+  // fake userQuestions 只暴露 ask()(0.1.5 形态: registerProvider 已被宿主删除) → 插件必须探测到
+  // 并改走 'user-questions/request' waterfall listener, 且 prepend 抢在 GUI 应答者之前
+  checks['提问探测: 0.1.5 宿主(fake userQuestions 无 registerProvider)下注册 waterfall listener']
+    = (eventHandlers.get('user-questions/request') ?? []).length >= 1
+  checks['提问探测: prepend 抢在 GUI 应答者之前(waterfall outermost-first)']
+    = eventHandlers.get('user-questions/request')?.[0] !== guiQuestionHandler
+  // 非 MCP 会话的提问必须 return next() 透传给 GUI 应答链(不被 MCP 抢走而无人应答)
+  {
+    const guiOnlyAnswer = await askUserQuestions({
+      questions: [{ id: 'gq1', question: 'GUI only?' }],
+      agent: { id: 'sess-gui-only', session: { id: 'sess-gui-only' } },
+      signal: new AbortController().signal,
+    })
+    checks['提问降级: 非 MCP 会话的提问透传给 GUI 应答者'] = guiOnlyAnswer?.answers?.[0]?.custom === 'gui-claimed'
+    checks['提问降级: 透传后 MCP 侧无该提问挂起'] = innerOf(await call(init.sid, 'pending_prompts', { sessionId: 'sess-gui-only' })).total === 0
+  }
+  // MCP 任务期的提问: task_inbox 起任务(QUESTION_CWD 的 agent 在 followup 里派发 waterfall 提问)
+  // → progress waiting_input / pending_prompts 感知 → prompt_respond answer → 应答链 resolve → 任务完成
+  const qInbox = await call(init.sid, 'task_inbox', { task: 'need db choice', cwd: QUESTION_CWD })
+  const qTaskId = innerOf(qInbox).taskId
+  let qProg
+  for (let i = 0; i < 100; i++) {
+    await new Promise((r) => setTimeout(r, 50))
+    const inner = innerOf(await call(init.sid, 'task_result', { taskId: qTaskId }))
+    if (inner.progress?.status === 'waiting_input') { qProg = inner.progress; break }
+    if (inner.status === 'done' || inner.status === 'error') break
+  }
+  const qPrompt = qProg?.prompts?.find((p) => p.type === 'question')
+  checks['提问感知(MCP 任务期): progress waiting_input + 原文'] = qPrompt !== undefined
+    && qPrompt.questions?.[0]?.question === 'Which DB?'
+  const ppQ = innerOf(await call(init.sid, 'pending_prompts', {}))
+  const qListed = ppQ.prompts.find((p) => p.type === 'question' && p.id === qPrompt?.id)
+  checks['pending_prompts: 列出提问弹窗(含原文, 无「未接管」note)'] = qListed !== undefined
+    && qListed.questions?.[0]?.question === 'Which DB?' && qListed.note === undefined
+  const qSid = String(qListed?.sessionId)
+  const respQ = await call(init.sid, 'prompt_respond', { sessionId: qSid, promptId: String(qPrompt?.id), answer: 'pg' })
   checks['prompt_respond: 提问自由文本回答'] = innerOf(respQ).ok === true
-  const qAnswer = await askPromise
-  checks['提问 provider 收到回答'] = qAnswer.answers?.[0]?.custom === 'pg'
+  const qAnswer = agentsById.get(qSid)?.questionAnswer
+  checks['提问应答链收到回答(0.1.5 answer 形态: answers[{id,selected,custom}])']
+    = qAnswer?.answers?.[0]?.id === 'q1' && qAnswer?.answers?.[0]?.custom === 'pg'
+      && Array.isArray(qAnswer?.answers?.[0]?.selected)
+  let qDone
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 50))
+    const inner = innerOf(await call(init.sid, 'task_result', { taskId: qTaskId }))
+    if (inner.status === 'done' || inner.status === 'error') { qDone = inner; break }
+  }
+  checks['提问回答后任务继续并完成'] = qDone?.status === 'done' && String(qDone?.result?.sessionId) === qSid
   // 【2+3】提问 notice: ⏳ 接管提示拦截当下即时入 inbox(user 形状); ✅ 回答提示入队,
   // 工具完成后统一经 tools/post-execute 落点
+  const qAgent = agentsById.get(qSid)
   const qLog = qAgent?.session.log ?? []
   const qNoticesAtIntercept = qLog.filter((e) => e.type === 'user/message' && e.data?.source?.form === 'notice')
   checks['提问 notice: 拦截期不写日志'] = qNoticesAtIntercept.length === 0
@@ -961,6 +1042,51 @@ try {
   await new Promise((r) => setTimeout(r, 500))
   checks['存量捞回: live 列表会话补挂'] = attachedIds.includes('sess-live2')
   checks['存量捞回: 持久化会话补挂'] = attachedIds.includes('sess-persisted')
+
+  // ── 增量18b: 旧宿主(≤0.1.1)兼容探测 —— 第二个 fake ctx 暴露 registerProvider, 插件必须走老路径 ──
+  // 放在末尾: 第二次 apply 会改写模块级 questionsProviderOurs/pendingQuestions, 不能影响前面的用例
+  {
+    let legacyAsk
+    const legacyEvents = new Map()
+    const legacyCtx = {
+      ...ctx,
+      get: (name) => (name === 'userQuestions'
+        ? { registerProvider: (p) => { legacyAsk = p.ask; return () => { legacyAsk = undefined } } }
+        : ctx.get(name)),
+      on: (name, handler, options) => {
+        const list = legacyEvents.get(name) ?? []
+        if (options?.prepend) list.unshift(handler); else list.push(handler)
+        legacyEvents.set(name, list)
+        return () => { const i = list.indexOf(handler); if (i >= 0) list.splice(i, 1) }
+      },
+    }
+    const mainDisposer = disposer
+    await apply(legacyCtx, { port: PORT + 1, host: '127.0.0.1', workspaceRoots: [FAKE_CWD] })
+    // fake ctx.effect 会把模块级 disposer 变量改写为第二次 apply 的清理函数: 取出后立刻还原,
+    // 让末尾的 disposer() 仍关第一个 server(legacyDisposer 只用于本块收尾)
+    const legacyDisposer = disposer
+    disposer = mainDisposer
+    await new Promise((r) => setTimeout(r, 200))
+    checks['旧宿主探测: registerProvider 存在时走老路径(不注册 waterfall listener)']
+      = typeof legacyAsk === 'function' && (legacyEvents.get('user-questions/request') ?? []).length === 0
+    if (typeof legacyAsk === 'function') {
+      const legacyAnswerPromise = legacyAsk({
+        questions: [{ id: 'lq1', question: 'legacy host?' }],
+        agent: { id: 'sess-legacy', session: { id: 'sess-legacy' } },
+        signal: new AbortController().signal,
+      })
+      await new Promise((r) => setTimeout(r, 100))
+      const legacyListed = innerOf(await call(init.sid, 'pending_prompts', { sessionId: 'sess-legacy' }))
+        .prompts.find((p) => p.type === 'question' && p.questions?.[0]?.question === 'legacy host?')
+      checks['旧宿主: 提问挂起可被 pending_prompts 感知'] = legacyListed !== undefined
+      if (legacyListed !== undefined) {
+        const legacyResp = await call(init.sid, 'prompt_respond', { sessionId: 'sess-legacy', promptId: legacyListed.id, answer: 'yes' })
+        checks['旧宿主: prompt_respond 可答(老路径仍可用)'] = innerOf(legacyResp).ok === true
+        checks['旧宿主: 老路径答案形态与 0.1.5 一致'] = (await legacyAnswerPromise)?.answers?.[0]?.custom === 'yes'
+      }
+    }
+    await legacyDisposer()
+  }
 
   const failed = Object.entries(checks).filter(([, ok]) => !ok)
   for (const [name, ok] of Object.entries(checks)) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}`)

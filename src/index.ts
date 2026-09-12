@@ -76,7 +76,6 @@ import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import schemastery from '@deepseek-ai/schemastery'
 import { realpath } from 'node:fs/promises'
 import http from 'node:http'
@@ -86,7 +85,7 @@ import { resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.10.3"
+export const VERSION = "0.10.5"
 
 /**
  * 声明依赖的核心服务。
@@ -179,7 +178,7 @@ const HarnessMcpSettingsSchema = schemastery.object({
 /** ctx.settings 的结构化最小面(避免绑定宿主具体实现类型) */
 interface SettingsProviderLike {
   register(
-    ns: ReturnType<typeof settingsNamespace>,
+    ns: string,
     schema: unknown,
     options?: {
       base?: Partial<HarnessMcpSettings>
@@ -706,7 +705,7 @@ async function taskProgressOf(ctx: Context, item: TaskItem): Promise<Record<stri
   if (currentTool) info.currentTool = currentTool
   if (lastText) info.lastText = lastText
 
-  // 等待输入感知: 审批(本插件应答链挂起)与提问(本插件 provider 挂起 / GUI 路由的挂起 ask_user_question)
+  // 等待输入感知: 审批(本插件应答链挂起)与提问(本插件接管 / 未接管时 GUI 应答链的挂起 ask_user_question)
   // → status=waiting_input + prompts[], 供 MCP 调用方感知弹窗并响应(prompt_respond / web GUI)
   const prompts: Record<string, unknown>[] = []
   for (const pa of pendingApprovals.values()) {
@@ -720,7 +719,7 @@ async function taskProgressOf(ctx: Context, item: TaskItem): Promise<Record<stri
   if (!questionsProviderOurs) {
     const detected = detectPendingAskUser(session)
     if (detected) {
-      prompts.push({ type: 'question', id: detected.id, questions: detected.questions, note: 'routed to the web GUI provider; answer in the DSH web UI' })
+      prompts.push({ type: 'question', id: detected.id, questions: detected.questions, note: 'not claimed by MCP (MCP only claims questions asked while it drives the session); answer it in the DSH web UI' })
     }
   }
   if (prompts.length > 0) {
@@ -770,7 +769,7 @@ function resolveAgentModel(ctx: Context, modelOpts?: { provider?: string; model?
   return { provider, model }
 }
 
-/** 待响应的提问 prompt(仅当本插件持有 user-questions provider 时产生; web GUI 占槽时提问走 GUI) */
+/** 待响应的提问 prompt(仅当本插件持有提问应答权 questionsProviderOurs 时产生; 否则提问走 web GUI 应答链) */
 interface PendingQuestion {
   promptId: string
   agentId: string
@@ -807,7 +806,8 @@ const pendingApprovals = new Map<string, {
 }>()
 /** 待响应的提问 prompt */
 const pendingQuestions = new Map<string, PendingQuestion>()
-/** 提问 provider 是否由本插件持有(false = web GUI 占槽, 提问路由到 GUI) */
+/** 本插件是否持有提问应答权(true = 提问由 MCP 接管, prompt_respond 可答; false = 交给 web GUI 应答链)。
+ *  dsh-user-questions 两版宿主各有取得方式(旧版 registerProvider / 新版 waterfall listener), 详见 apply()。 */
 let questionsProviderOurs = false
 /** 会话级模型覆盖(sessionId → {provider?, model}): session_set_model 记录, resume 时同样生效 */
 const sessionModelOverrides = new Map<string, { provider?: string; model: string }>()
@@ -1010,7 +1010,7 @@ function approvalPromptIdOf(req: { agent: { session: unknown }; toolName: string
   return `approval-${req.toolName}-${Date.now()}`
 }
 
-/** 检测挂起的 ask_user_question 工具调用(web GUI 持有提问 provider 时, 这是感知提问的唯一途径):
+/** 检测挂起的 ask_user_question 工具调用(本插件未接管该提问时, 这是感知它的唯一途径):
  *  倒查最后一条 ask_user_question 的 tool/call, 其后没有 tool/result 即为挂起。 */
 function detectPendingAskUser(session: unknown): { id: string; questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }> } | undefined {
   const log = (session as { log?: unknown[] }).log ?? []
@@ -2347,13 +2347,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       for (const pq of pendingQuestions.values()) {
         if (!sessionId || pq.agentId === sessionId) prompts.push({ sessionId: pq.agentId, type: 'question', id: pq.promptId, questions: pq.questions })
       }
-      // web GUI 持有提问 provider 时, MCP 会话里挂起的 ask_user_question 调用仍可感知(应答在 GUI)
+      // 本插件未接管提问时(questionsProviderOurs=false), MCP 会话里挂起的 ask_user_question 仍可感知(应答在 GUI)
       if (!questionsProviderOurs) {
         for (const sid of (sessionId ? [sessionId] : [...mcpSessionIds])) {
           const agent = liveAgentFor(ctx, sid)
           const detected = agent !== undefined ? detectPendingAskUser(agent.session) : undefined
           if (detected) {
-            prompts.push({ sessionId: sid, type: 'question', id: detected.id, questions: detected.questions, note: 'routed to the web GUI provider; answer in the DSH web UI' })
+            prompts.push({ sessionId: sid, type: 'question', id: detected.id, questions: detected.questions, note: 'not claimed by MCP (MCP only claims questions asked while it drives the session); answer it in the DSH web UI' })
           }
         }
       }
@@ -2390,11 +2390,11 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         pq.resolve({ answers: answered })
         return out(JSON.stringify({ ok: true, promptId, type: 'question', answered: answered.length }, null, 2))
       }
-      // 未挂起: 若是 GUI 路由的挂起提问则给出明确指引
+      // 未挂起: 若是 MCP 未接管、由 web GUI 应答链处理的挂起提问, 给出明确指引
       const agent = liveAgentFor(ctx, sessionId)
       const detected = agent !== undefined ? detectPendingAskUser(agent.session) : undefined
       if (detected !== undefined && detected.id === promptId && !questionsProviderOurs) {
-        return err(JSON.stringify({ error: 'this question is routed to the web GUI provider; answer it in the DSH web UI (the MCP-side provider slot is owned by the GUI in this deployment)' }))
+        return err(JSON.stringify({ error: 'this question was not claimed by MCP (MCP only claims questions asked while it drives the session); answer it in the DSH web UI' }))
       }
       return err(JSON.stringify({ error: `prompt not found: ${promptId}` }))
     },
@@ -2596,65 +2596,112 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     },
   )
 
-  // ── 提问 provider: 单槽能力缝; web GUI 已占用时降级(提问路由到 GUI, MCP 仍可感知但需在 GUI 应答) ──
+  // ── 提问应答者: 把挂起的 ask_user_question 交接给 MCP 调用方(用 prompt_respond 应答) ──
+  // dsh-user-questions 有两代宿主形态, 用 API 探测兼容(两版宿主都要能跑):
+  //   ① ≤0.1.1(旧版): UserQuestionService 有单槽 registerProvider(provider) —— 先到先得, 注册成功即全量接管;
+  //   ② ≥0.1.5(新版): registerProvider 被删除(2026-09 升级), 改为 Agent 作用域 waterfall 事件
+  //      'user-questions/request'。web GUI 客户端以 ctx.remote.$on 挂在同一事件上, waterfall 语义
+  //      outermost-first、不调 next() 即 veto 后续 listener —— 故用 prepend 抢先认领(与 approval/request 同款)。
+  // ⚠️ 只试 ①(旧代码)正是本 bug 的根因: 0.1.5 上 registerProvider 为 undefined → 静默跳过注册 →
+  //    questionsProviderOurs=false → 提问全落到 GUI listener → prompt_respond 走「未挂起」拒绝分支。
+  interface UserQuestionRequestView {
+    questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }>
+    agent?: { id: unknown; session?: unknown }
+    signal?: AbortSignal
+  }
+
+  /** 提问交接实现(两版宿主共用): 生成 promptId → 挂 pendingQuestions → 等 prompt_respond / abort 落定。
+   *  返回 AskUserQuestionAnswer = { answers: [{ id, selected, custom }] } ——
+   *  已对照 0.1.5 lib/types/types.d.ts 确认答案形态与 0.1.1 一致(selected 可为空数组, 自由文本走 custom)。 */
+  const answerQuestionViaMcp = (request: unknown): Promise<{ answers: Array<{ id: string; selected: string[]; custom?: string }> }> => {
+    const r = request as UserQuestionRequestView
+    const promptId = `q-${randomUUID()}`
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const settle = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        pendingQuestions.delete(promptId)
+        r.signal?.removeEventListener('abort', onAbort)
+        fn()
+      }
+      const onAbort = () => settle(() => reject(new Error('ask_user_question was aborted before the user answered')))
+      pendingQuestions.set(promptId, {
+        promptId,
+        agentId: r.agent !== undefined ? String(r.agent.id) : '(host)',
+        questions: r.questions.map((q) => ({
+          id: q.id,
+          question: q.question,
+          ...(q.detail !== undefined ? { detail: q.detail } : {}),
+          ...(q.options !== undefined ? { options: (q.options ?? []).map((o) => ({ label: o.label })) } : {}),
+        })),
+        resolve: (answer) => settle(() => {
+          // 【2】web UI 提示(入队, 工具完成后安全落点): 提问已由 MCP 响应
+          if (r.agent !== undefined) queuePromptNotice(r.agent, `✅ 提问 ${promptId} 已由 MCP 侧回答`, '✅ 提问已由 MCP 回答')
+          resolve(answer)
+        }),
+        reject: (e) => settle(() => {
+          if (r.agent !== undefined) queuePromptNotice(r.agent, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, '❌ 提问已取消/失败')
+          reject(e)
+        }),
+      })
+      r.signal?.addEventListener('abort', onAbort, { once: true })
+      // 【2+3】web UI 提示: 该提问已被 MCP 拦截接管 —— ⏳ 走挂起期即时投递
+      // (notifyPromptIntercepted, 同审批; 拦截期不可直接写 user/message, 见该函数注释)
+      if (r.agent !== undefined) {
+        const first = r.questions[0]
+        notifyPromptIntercepted(r.agent, `⏳ 提问已由 MCP 接管（${first?.question ?? '…'}），等待 Hermes/客户端响应（prompt ${promptId}）`, '⏳ 提问已由 MCP 接管')
+      }
+    })
+  }
+
+  /** 提问接管判据(与 onApprovalRequest 同判据): 会话属 MCP 且此刻正被 MCP 任务驱动才认领,
+   *  否则 next() 透传给 web GUI 应答链 —— 用户经 web UI 直接向「MCP 用过的会话」发消息时, 提问照常
+   *  弹在 GUI, 不会 MCP/GUI 两端都收不到而挂死(审批应答者 0.9.10 已按同一判据收紧, 提问沿用同闸)。
+   *  【放宽】若要复刻旧版 registerProvider 的「无条件全量接管」, 让本函数恒返回 true 即可; 但那样
+   *  web GUI 自己发起的提问也会被 MCP 抢走而无人应答(GUI 不再渲染问题卡), 故默认不做。 */
+  const mcpOwnsQuestion = (agentId: string | undefined): boolean =>
+    agentId !== undefined && mcpSessionIds.has(agentId) && mcpBusySessionIds.has(agentId)
+
   const userQuestions = ctx.get('userQuestions') as {
     registerProvider?: (p: { ask: (request: unknown) => Promise<unknown> }) => () => void
   } | undefined
-  if (userQuestions?.registerProvider) {
+
+  let questionAnswererMode: 'legacy-provider' | 'waterfall-listener' | 'none' = 'none'
+  const legacyRegisterProvider = userQuestions?.registerProvider
+  if (typeof legacyRegisterProvider === 'function') {
+    // ① 旧版宿主(≤0.1.1): 单槽 provider。槽被 GUI 占先时抛 DUPLICATE_PROVIDER → 保持不接管(旧行为不变)
     try {
-      userQuestions.registerProvider({
-        ask: (request) => {
-          const r = request as {
-            questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }>
-            agent?: { id: unknown; session?: unknown }
-            signal?: AbortSignal
-          }
-          const promptId = `q-${randomUUID()}`
-          return new Promise((resolve, reject) => {
-            let settled = false
-            const settle = (fn: () => void) => {
-              if (settled) return
-              settled = true
-              pendingQuestions.delete(promptId)
-              r.signal?.removeEventListener('abort', onAbort)
-              fn()
-            }
-            const onAbort = () => settle(() => reject(new Error('ask_user_question was aborted before the user answered')))
-            pendingQuestions.set(promptId, {
-              promptId,
-              agentId: r.agent !== undefined ? String(r.agent.id) : '(host)',
-              questions: r.questions.map((q) => ({
-                id: q.id,
-                question: q.question,
-                ...(q.detail !== undefined ? { detail: q.detail } : {}),
-                ...(q.options !== undefined ? { options: (q.options ?? []).map((o) => ({ label: o.label })) } : {}),
-              })),
-              resolve: (answer) => settle(() => {
-                // 【2】web UI 提示(入队, 工具完成后安全落点): 提问已由 MCP 响应
-                if (r.agent !== undefined) queuePromptNotice(r.agent, `✅ 提问 ${promptId} 已由 MCP 侧回答`, '✅ 提问已由 MCP 回答')
-                resolve(answer)
-              }),
-              reject: (e) => settle(() => {
-                if (r.agent !== undefined) queuePromptNotice(r.agent, `❌ 提问 ${promptId} 已取消/失败: ${(e as Error)?.message ?? String(e)}`, '❌ 提问已取消/失败')
-                reject(e)
-              }),
-            })
-            r.signal?.addEventListener('abort', onAbort, { once: true })
-            // 【2+3】web UI 提示: 该提问已被 MCP 拦截接管 —— ⏳ 走挂起期即时投递
-            // (notifyPromptIntercepted, 同审批; 拦截期不可直接写 user/message, 见该函数注释)
-            if (r.agent !== undefined) {
-              const first = r.questions[0]
-              notifyPromptIntercepted(r.agent, `⏳ 提问已由 MCP 接管（${first?.question ?? '…'}），等待 Hermes/客户端响应（prompt ${promptId}）`, '⏳ 提问已由 MCP 接管')
-            }
-          })
-        },
-      })
-      questionsProviderOurs = true
-      console.log('[harness-mcp-server] user-questions provider registered (question prompts answerable via prompt_respond)')
+      legacyRegisterProvider.call(userQuestions, { ask: (request) => answerQuestionViaMcp(request) })
+      questionAnswererMode = 'legacy-provider'
     } catch {
-      questionsProviderOurs = false
-      console.warn('[harness-mcp-server] user-questions provider already registered (web GUI); question prompts route to the GUI and remain visible via progress/pending_prompts')
+      questionAnswererMode = 'none'
     }
+  } else {
+    // ② 新版宿主(≥0.1.5): 注册到 waterfall, prepend 抢在 web GUI 的 remote listener 之前。
+    //    listener 签名 (request, next) —— 认领即返回答案(不调 next, veto 后续应答者);
+    //    不认领(非 MCP 会话/非 MCP 任务期)必须 return next() 透传给 GUI。
+    try {
+      ;(ctx.on as unknown as (name: string, listener: unknown, options?: { prepend?: boolean }) => unknown)(
+        'user-questions/request',
+        (request: unknown, next: () => Promise<unknown>): Promise<unknown> => {
+          if (!mcpOwnsQuestion(agentIdOf((request as UserQuestionRequestView).agent))) return next()
+          return answerQuestionViaMcp(request)
+        },
+        { prepend: true },
+      )
+      questionAnswererMode = 'waterfall-listener'
+    } catch {
+      questionAnswererMode = 'none'
+    }
+  }
+  questionsProviderOurs = questionAnswererMode !== 'none'
+  if (questionAnswererMode === 'legacy-provider') {
+    console.log('[harness-mcp-server] user-questions answerer registered via legacy registerProvider() (dsh-user-questions ≤0.1.1); question prompts answerable via prompt_respond')
+  } else if (questionAnswererMode === 'waterfall-listener') {
+    console.log("[harness-mcp-server] user-questions answerer registered on the 'user-questions/request' waterfall, prepend (dsh-user-questions ≥0.1.5); question prompts answerable via prompt_respond")
+  } else {
+    console.warn('[harness-mcp-server] user-questions answerer not registered (legacy host, provider slot already taken); question prompts route to the web GUI answerer and remain visible via progress/pending_prompts')
   }
 
   const servers = new Map<string, McpServer>()
@@ -2762,7 +2809,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       ['settings'],
       (settingsCtx: { settings: SettingsProviderLike }) => {
     const scope = settingsCtx.settings.register(
-      settingsNamespace(SETTINGS_NAMESPACE),
+      SETTINGS_NAMESPACE,
       HarnessMcpSettingsSchema,
       {
         base: {
