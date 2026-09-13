@@ -258,6 +258,21 @@ printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
         # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
 ```
 
+## 开发与验证
+
+两个互补的 dev-only 套件（都不随包发布）：
+
+- `npm run smoke` —— **契约级冒烟**（约 140 条断言）：用 minimal fake ctx + 仿真 agent 直接驱动 `apply()`；
+  仿真 agent 严格遵循真实 `agent-loop` 的时序（`followup` 只入队+唤醒，`turn/start`…`turn/end` 在随后的宏任务里
+  才落日志，turn 边界恰好 claim 一条排队输入）。覆盖全部 20 个工具的契约：派活返回形状、`session_status` 各
+  phase、`session_tail` 过滤、`session_wait`/`session_cancel`、非驻池 resume 句柄的 flush+dispose、
+  `preset_list` 目录、按 preset/mode 建会话、自动命名、弹窗接管，以及 notice 安全落点回归。
+  不需要真实 dsh 进程，`node smoke.mjs` 即可。
+- `npm run verify` —— **端到端**（`verify-session-turn.mjs`，约 68 条断言）：起真实 `McpServer` +
+  StreamableHTTP transport，用真实 MCP 客户端驱动；包含对真实持久化会话日志的冷读（官方 `sessionPersistence`
+  读句柄 + `zstd` 解压落盘兜底两条路径）与 `interrupted` 判定。依赖本机某个特定会话的段落会在该会话不存在时
+  自动跳过。
+
 ## 定位
 
 它最适合当**备用工具**，而不是日常主力：日常改代码直接驱动你的主 agent 即可。当需要**上下文隔离**（大型重构会把客户端上下文撑爆）或**并行执行**互不相干的任务时，再启用它。

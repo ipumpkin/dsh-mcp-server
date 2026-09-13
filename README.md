@@ -256,6 +256,21 @@ Two layers, resolved in order (schema default → entry-config base → user lay
         # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
 ```
 
+## Development & verification
+
+Two complementary, dev-only suites (neither is shipped):
+
+- `npm run smoke` — **contract smoke** (~140 assertions): drives `apply()` with a minimal fake ctx and a fake
+  agent that follows real `agent-loop` ordering (`followup` only queues + wakes; `turn/start`…`turn/end` land
+  in a later task, and a turn boundary claims exactly one queued message). Covers all 20 tool contracts:
+  dispatch shape, `session_status` phases, `session_tail` filtering, `session_wait`/`session_cancel`,
+  resume/flush/dispose of a non-pooled handle, `preset_list`, mode creation, auto-naming, prompt takeover,
+  and the notice safe-landing regression. No real dsh process needed — plain `node smoke.mjs`.
+- `npm run verify` — **end-to-end** (`verify-session-turn.mjs`, ~68 assertions): boots the real `McpServer` +
+  StreamableHTTP transport and drives it with a real MCP client, including cold reads of a genuinely persisted
+  session log (official `sessionPersistence` read handle + `zstd`-decompressed on-disk fallback) and the
+  `interrupted` path. Sections that need a specific local session skip themselves when it is absent.
+
 ## Positioning
 
 This is best used as a **fallback tool**, not a daily driver: for everyday code edits, drive your primary agent directly. Reach for this when you need **context isolation** (huge refactors that would blow the client's context) or **parallel execution** of unrelated tasks.

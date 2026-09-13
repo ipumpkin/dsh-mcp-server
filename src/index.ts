@@ -93,7 +93,7 @@ import { join, resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.12.0"
+export const VERSION = "0.12.1"
 
 /**
  * 声明依赖的核心服务。
@@ -723,9 +723,22 @@ const mcpPendingTurns = new Map<string, number>()
 /** sessionId → turn/end 观测器的 disposer(每个有在飞 turn 的会话只挂一个, 计数归零即摘除) */
 const mcpTurnWatchers = new Map<string, () => void>()
 
-/** 该会话是否有 MCP 在飞 turn(审批/提问接管判据的第二半) */
-function mcpTurnInFlight(sessionId: string): boolean {
-  return (mcpPendingTurns.get(sessionId) ?? 0) > 0
+/**
+ * 该会话此刻是否真有 MCP 在飞 turn(审批/提问接管判据的第二半)。
+ * 计数只是提示, **会话日志才是权威**: 计数残留(取消时丢弃排队输入 / 事件丢失)绝不能让插件误接管一个
+ * 已经没有 MCP 工作的会话 —— 那正是「用户经 web UI 直发消息触发的弹窗被 MCP 抢走、两端都无人应答」
+ * 的死锁根因。因此两个条件都要满足:
+ *   ① mcpPendingTurns > 0(本会话有 session_send 投喂且尚未全部落定);
+ *   ② 此刻确实有活干 —— 有在飞 turn(日志折叠)或队列里还有待 claim 的输入。
+ * 拿不到 agent(只有 id)时无法核实 ②, 退化为只看 ①。
+ */
+function mcpTurnInFlight(sessionId: string, agent?: unknown): boolean {
+  if ((mcpPendingTurns.get(sessionId) ?? 0) <= 0) return false
+  const session = (agent as { session?: unknown } | undefined)?.session
+  if (session === undefined) return true
+  if (foldTurnState((session as { log?: readonly unknown[] }).log ?? []).openTurn !== null) return true
+  const inbox = (agent as { inbox?: { nextTurn?: readonly unknown[] } } | undefined)?.inbox
+  return (inbox?.nextTurn?.length ?? 0) > 0
 }
 
 /** 投喂后登记一个 MCP 在飞 turn(+1); 首次登记时挂一个「该会话下一次 turn/end 就 -1」的观测器 */
@@ -1437,34 +1450,47 @@ function composeTaskMessage(context: string, task: string): string {
 const DETACHED_RELEASE_MAX_MS = 60 * 60 * 1000
 
 /**
- * 投喂后登记: 该会话「下一个 turn/end」落定时释放临时 resume 句柄(flush + dispose)。
- * 与旧 executeTask 的 disposeAfter 语义对齐 —— 区别只在于**投喂方不再持有等待**, 释放改由事件驱动。
- * 只在非驻池(resume 出来的独占句柄)上调用; 驻池句柄永不 dispose。
+ * 非驻池 resume 句柄的释放登记: 该会话「本轮 turn/end」落定时 flush + dispose(与旧 executeTask 的
+ * disposeAfter 语义对齐 —— 区别只在于**投喂方不再持有等待**, 释放改由事件驱动)。
+ *
+ * ⚠️ 必须在 agent.followup() **之前**调用: 真实 agent-loop 的 followup 只是入队+唤醒, turn/start 通常
+ * 晚于本次调用才落日志; 但宿主实现完全可能同步开 turn —— 那时若在 followup 之后才挂观测器, 就永远看不到
+ * 那个 turn/start。因此这里对 turn/end 的判据是「本观测器记到的那个 turn」**或**「还没记到任何 turn/start
+ * 时的第一次 turn/end」(resume 出来的会话此刻必空闲, 在飞 turn 只可能是本轮投喂的)。
+ * 找不到 turn/end(事件丢失)时由 DETACHED_RELEASE_MAX_MS 兜底, 防句柄泄漏。
+ *
+ * @returns finish —— 立即 flush+dispose 的幂等函数(投喂失败路径直接调用, 不留悬挂观测器)
  */
-function releaseAfterTurn(ctx: Context, sessionId: string, handle: AgentHandle): void {
+function releaseAfterTurn(ctx: Context, sessionId: string, handle: AgentHandle): () => Promise<void> {
   let done = false
   let ourTurn: number | null = null
   let timer: ReturnType<typeof setTimeout> | undefined
-  const finish = async (): Promise<void> => {
-    if (done) return
+  let pending: Promise<void> = Promise.resolve()
+  const finish = (): Promise<void> => {
+    if (done) return pending
     done = true
     if (timer !== undefined) clearTimeout(timer)
     off?.()
-    try {
-      await (ctx.get('sessions') as { flush?: (s: unknown) => Promise<unknown> } | undefined)?.flush?.(handle.agent.session)
-    } catch { /* flush 失败不阻断释放 */ }
-    try { await handle.dispose() } catch { /* 释放失败不影响调用方 */ }
+    pending = (async () => {
+      try {
+        await (ctx.get('sessions') as { flush?: (s: unknown) => Promise<unknown> } | undefined)?.flush?.(handle.agent.session)
+      } catch { /* flush 失败不阻断释放 */ }
+      try { await handle.dispose() } catch { /* 释放失败不影响调用方 */ }
+    })()
+    return pending
   }
   const off = onSessionEvent(ctx, sessionId, (event) => {
     const e = event as EventView
     if (e.type === 'turn/start') {
       if (ourTurn === null) ourTurn = Number((e.data as { turn?: unknown } | undefined)?.turn ?? 0)
-    } else if (e.type === 'turn/end' && ourTurn !== null && Number((e.data as { turn?: unknown } | undefined)?.turn ?? -1) === ourTurn) {
-      void finish()
+    } else if (e.type === 'turn/end') {
+      const turn = Number((e.data as { turn?: unknown } | undefined)?.turn ?? -1)
+      if (ourTurn === null || turn === ourTurn) void finish()
     }
   })
   timer = setTimeout(() => void finish(), DETACHED_RELEASE_MAX_MS)
   if (typeof timer === 'object' && timer !== null) (timer as { unref?: () => void }).unref?.()
+  return finish
 }
 
 // ── 主动查询: session_status 组装(供 session_status / session_wait 共用) ──
@@ -2010,6 +2036,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         const sid = String(resolved.sessionId)
         // 登记「MCP 在飞 turn」(审批/提问接管判据): 该会话 turn/end 落定时自动 -1
         markMcpTurn(ctx, sid)
+        // 非驻池 resume 句柄: 先武装释放观测器(必须在 followup 之前, 见 releaseAfterTurn 注释),
+        // 本轮 turn 结束后 flush + dispose —— 不驻池, 也不阻塞本次调用
+        const releaseNow = resolved.disposeAfter ? releaseAfterTurn(ctx, sid, resolved.handle) : undefined
         try {
           agent.followup(createUserMessage({
             content: [{ type: 'text', text: composeTaskMessage(context ?? '', message) }],
@@ -2017,11 +2046,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           }))
         } catch (e) {
           unmarkMcpTurn(sid)
-          if (resolved.disposeAfter) { try { await resolved.handle.dispose() } catch { /* ignore */ } }
+          await releaseNow?.()
           return err(JSON.stringify({ error: `send failed: ${(e as Error)?.message ?? String(e)}` }))
         }
-        // 非驻池 resume 句柄: 本轮 turn 结束后 flush + dispose(不驻池, 也不阻塞本次调用)
-        if (resolved.disposeAfter) releaseAfterTurn(ctx, sid, resolved.handle)
         const inbox = (agent as unknown as { inbox?: { nextTurn?: readonly unknown[]; nextStep?: readonly unknown[] } }).inbox
         const state = liveTurnState(ctx, agent.session)
         return out(JSON.stringify({
@@ -2185,13 +2212,16 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           note: 'session is not live in this process; nothing to cancel (its log is the source of truth — query session_status)',
         }))
       }
+      // 缺省 keepInbox=false 会丢弃队列里待 claim 的输入 —— 那些 turn 永远不会开, 计数要按丢弃条数扣掉;
+      // 活动回合的计数由它自己的 turn/end(aborted)事件扣。这里再扣一次会低估在飞工作(取消后队列里
+      // 仍有待 claim 的 MCP 投喂时会让计数提前归零)。
+      const queuedBefore = (agent as unknown as { inbox?: { nextTurn?: readonly unknown[] } }).inbox?.nextTurn?.length ?? 0
       try {
         agent.cancel({ kind: 'hook', reason: 'harness-mcp-cancel' }, keepInbox === undefined ? undefined : { keepInbox })
       } catch (e) {
         return err(JSON.stringify({ error: `cancel failed: ${(e as Error)?.message ?? String(e)}` }))
       }
-      // 已主动打断: 该会话不再计 MCP 在飞 turn(随后的 turn/end 事件到达时计数已为 0, 不受影响)
-      unmarkMcpTurn(sessionId)
+      if (keepInbox !== true) for (let i = 0; i < queuedBefore; i++) unmarkMcpTurn(sessionId)
       const state = liveTurnState(ctx, agent.session)
       return out(JSON.stringify({
         sessionId, live: true, cancelled: true, keepInbox: keepInbox === true,
@@ -2566,7 +2596,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     // 防御: agent.id 为权威; 个别实现只挂 session.id 时兜底
     const agentId = String(req.agent.id ?? (req.agent.session as { id?: unknown } | undefined)?.id)
     // 仅当会话属 MCP 且有 MCP 在飞 turn 才接管转达调用方; 否则交给 web GUI 应答链
-    if (!mcpSessionIds.has(agentId) || !mcpTurnInFlight(agentId)) return next()
+    if (!mcpSessionIds.has(agentId) || !mcpTurnInFlight(agentId, req.agent)) return next()
     const promptId = approvalPromptIdOf(req)
     return new Promise<string>((resolve) => {
       let settled = false
@@ -2676,8 +2706,11 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
    *  弹在 GUI, 不会 MCP/GUI 两端都收不到而挂死(审批应答者 0.9.10 已按同一判据收紧, 提问沿用同闸)。
    *  【放宽】若要复刻旧版 registerProvider 的「无条件全量接管」, 让本函数恒返回 true 即可; 但那样
    *  web GUI 自己发起的提问也会被 MCP 抢走而无人应答(GUI 不再渲染问题卡), 故默认不做。 */
-  const mcpOwnsQuestion = (agentId: string | undefined): boolean =>
-    agentId !== undefined && mcpSessionIds.has(agentId) && mcpTurnInFlight(agentId)
+  const mcpOwnsQuestion = (request: unknown): boolean => {
+    const agent = (request as { agent?: unknown } | undefined)?.agent
+    const agentId = agentIdOf(agent)
+    return agentId !== undefined && mcpSessionIds.has(agentId) && mcpTurnInFlight(agentId, agent)
+  }
 
   const userQuestions = ctx.get('userQuestions') as {
     registerProvider?: (p: { ask: (request: unknown) => Promise<unknown> }) => () => void
@@ -2701,7 +2734,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       ;(ctx.on as unknown as (name: string, listener: unknown, options?: { prepend?: boolean }) => unknown)(
         'user-questions/request',
         (request: unknown, next: () => Promise<unknown>): Promise<unknown> => {
-          if (!mcpOwnsQuestion(agentIdOf((request as UserQuestionRequestView).agent))) return next()
+          if (!mcpOwnsQuestion(request)) return next()
           return answerQuestionViaMcp(request)
         },
         { prepend: true },
