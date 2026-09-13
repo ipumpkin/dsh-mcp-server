@@ -3,21 +3,27 @@
  *
  * 适配 dsh >= 0.1.1-rc.2(rc.6 的 agent ctx 丢 scope 问题已在上游修复)。
  *
+ * 架构(v0.11.0): 「任务」层已降维为 **session + turn** —— 不再有 taskId/任务队列/内存态任务结果。
+ *  - 派活 = 往一个会话投喂一个 turn: session_send 组装 message 后 agent.followup() 立即返回(不等待/不超时阻塞)。
+ *  - 查询 = 主动去查: session_status / session_tail 以 **session log 为唯一事实源**。
+ *    live 会话读内存日志 + turnBoundaryProjection; 非 live(重启后)冷读持久化日志, 因此重启不丢状态。
+ *  - 结构化产物(changes/verification/leftovers)保留: 投喂模板要求 agent 输出一行 summary JSON,
+ *    session_status 从「最后一个 turn 边界内的 assistant 文本」parseSummary 提取。
+ *
  * 工具集:
  *   - echo                : 验证 MCP server 连通
  *   - harness_list_tools  : 列出 Harness 工具注册表
- *   - harness_status      : 系统水位总览(队列/agent 池/live 会话/运行时配置)
+ *   - harness_status      : 系统水位总览(agent 池/live 会话/运行时配置)
  *   - model_list          : 列出 provider 的模型目录, 供按任务选模型
- *   - mode_list           : 列出会话模式目录(agent preset / 沙箱访问模式 / 审批策略 / 权限预设), 供按任务选模式
+ *   - mode_list           : 列出会话模式目录(agent preset / 沙箱访问模式 / 审批策略 / 权限预设)
  *   - workspace_list      : 列出工作区及其会话分组
- *   - agent_run           : 同步执行任务(改代码/分析/跑命令), 返回结构化结果
- *   - task_inbox          : Hermes push 结构化任务(任务+记忆上下文)到 Harness 队列, 异步执行, 返回 taskId
- *   - task_result         : 取回任务的结构化结果(changes/verification/leftovers)
- *   - task_list           : 列出最近任务(状态/目录/时间)+ 会话上下文占用, 便于批量轮询
- *   - task_cancel         : 打断一个 running 任务(超时保护也走同一条 cancel 路径)
+ *   - session_send        : 【派活入口】把一条任务作为一个 turn 投喂进会话, 立即返回(不阻塞)
+ *   - session_status      : 【主动查询】phase/openTurn/lastTurn/prompts/context/summary, 以 session log 为准
+ *   - session_tail        : 【过程明细】按需拉取表面事件(消息文本/工具调用与结果/turn 边界)
+ *   - session_wait        : 【可选阻塞】单段 ≤240s 等 turn-end / idle / input; 超时返回 {timeout:true}
+ *   - session_cancel      : 打断会话当前回合(替代旧 task_cancel)
  *   - session_list        : 列出可续接的会话(池/live/持久化三层)+ 上下文占用, 供外部决定续接哪个 sessionId
  *   - session_read        : 读会话事件流(文本/工具调用/结果), 审计或续接前回顾
- *   - session_close       : 显式退役一个池会话(持久化保留, 可凭 sessionId 续接)
  *   - session_compact     : 把会话早期历史压缩成一段模型摘要(需宿主加载 compaction 后端, 如 dsh-compaction-basic)
  *   - pending_prompts     : 列出等待输入的弹窗(审批/提问)——MCP 调用方对 DSH 弹窗不再盲目
  *   - prompt_respond      : 响应弹窗(审批 approve/deny, 提问自由文本), 解除 agent 阻塞继续
@@ -30,40 +36,39 @@
  * 经 ctx.agentPresets.mount 挂载, meta.agentPreset 记入 session header)+ 沙箱访问模式(read-only /
  * workspace-write / danger-full-access, 会话级覆盖 = sandbox/mode 日志事件)+ 审批策略(ask / never,
  * 覆盖 = approval/policy 日志事件)。权限预设(ctx.permissionPresets)把沙箱+审批捆绑命名(如
- * workspace-write = workspace-write + ask)。agent_run/task_inbox 传 preset/mode/sandbox/approval 可在
- * 创建会话时应用模式(指定即强制全新会话, 避免后续再提权); 结果带 mode 快照验证生效, mode_list 列出可用模式。
+ * workspace-write = workspace-write + ask)。session_send 传 preset/mode/sandbox/approval 可在
+ * 创建会话时应用模式(指定即强制全新会话, 避免后续再提权); mode_list 列出可用模式。
  *
- * 上下文占用: session_list/task_list 与任务 result/progress(agent_run/task_inbox/task_result/task_wait)
- * 经 ctx.tokenMeter.measure(session) 输出事件数与启发式 token 数(固定密度定价, 与 dsh token-meter 同源),
- * 并经 ctx.llm.resolveModelInfo 解析模型 contextWindow 得占用比 ratio=tokens/window(百分比);
- * tokenMeter 缺失时整个 context 为 null, 窗口不可解析时 window/ratio 为 null。
+ * 上下文占用: session_list 与 session_status(仅 live)经 ctx.tokenMeter.measure(session) 输出事件数与
+ * 启发式 token 数(固定密度定价, 与 dsh token-meter 同源), 并经 ctx.llm.resolveModelInfo 解析模型
+ * contextWindow 得占用比 ratio=tokens/window(百分比); tokenMeter 缺失时整个 context 为 null,
+ * 窗口不可解析时 window/ratio 为 null。非 live 会话没有 Session 对象可供计量, context 为 null。
  *
  * 会话复用策略(外部显式控制): 缺省按 cwd 复用常驻池会话(省上下文加载, 但历史随任务数增长);
  * 外部可传 newSession:true 强制全新会话(旧会话退役但持久化保留), 或传 sessionId 精确续接, 或用
- * session_list/session_close 自行盘点与退役 —— 是否复用完全由调用方决定。
+ * session_list 自行盘点(常驻池按 LRU 自动淘汰, 退役只由池策略决定) —— 是否复用完全由调用方决定。
  *
  * 客户端契约要点:
- *  - agent_run 同步执行, 传 timeoutMs 超时自动转异步(返回 taskId, 用 task_result/task_wait/task_cancel 跟进);
- *    所有任务(含同步)都注册进队列并回填真实 taskId, 均可查可取消。
- *  - 进度汇报: task_wait/task_result/转异步响应/未完成任务行带 progress 字段
- *    {status, events, toolCalls, currentTool:{name,args}, lastText}, 客户端可据此实时汇报"正在执行到哪一步"。
- *  - 取消语义: agent 已就绪的任务走 cancel 钩子; 等锁/排队中的任务(task_cancel 置 cancelled)
- *    在锁释放后执行前由 shouldAbort 检查中止 —— 任何状态的任务都可取消。
+ *  - session_send 立即返回 {sessionId, inboxDepth, openTurn}; 之后用 session_status 主动查询,
+ *    或用 session_wait 可选阻塞一段(≤240s)。没有 taskId, 也没有服务端排队与 TTL。
+ *  - 取消语义: session_cancel → agent.cancel({kind:'hook',reason:'harness-mcp-cancel'}), 回落 turn/end
+ *    reason.kind='aborted'(keepInbox=true 时保留未开始的排队输入)。
  *  - 错误响应统一 {error:...} JSON + isError 标记。
- *  - 忙会话保护: LRU 淘汰 / session_close / newSession 都不会 dispose 正在跑任务的 agent(软上限/拒绝/摘除)。
+ *  - 忙会话保护: LRU 淘汰与 newSession 都不会 dispose 正在跑 turn 的 agent(池软超上限, 任务落定后再回收)。
  *
  * sessionId 续接: 指定 sessionId 时按 本进程池 → live 会话(UI 手开)→ 持久化 resume 三级接管,
  * 前两者都找不到才报错, 所以进程重启前/UI 手开的会话也能续接。
  * 工作区分组: cwd 先 realpath 规范化再 `workspaceRegistry.resolveByPath ?? create` + attachSession;
  * 启动时对存量未分组会话补挂一次(存量捞回)。
  *
- * 回路: Hermes 记忆 →(context)→ task_inbox → Harness agent 执行 → 结果进队列 → task_result → Hermes 持久化
+ * 回路: Hermes 记忆 →(context)→ session_send → Harness agent 执行一个 turn → 结果落 session log
+ *       → session_status/session_tail 主动查询 → Hermes 持久化
  */
 import type { Context } from '@deepseek-ai/cordis';
 /** Cordis 插件名 */
 export declare const name = "harness-mcp-server";
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export declare const VERSION = "0.10.5";
+export declare const VERSION = "0.11.0";
 /**
  * 声明依赖的核心服务。
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——
@@ -81,13 +86,9 @@ export interface Config {
     model?: string;
     /** 挂载的 agent preset(默认 standard) */
     preset?: string;
-    /** 任务队列容量上限(默认 100) */
-    maxQueue?: number;
-    /** 已完成任务保留毫秒数(默认 60 分钟, 对齐 taskTimeoutMs, 避免异步工作流丢结果) */
-    taskTtlMs?: number;
     /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
     maxAgents?: number;
-    /** 单任务超时毫秒数, 超时自动 cancel 并回收部分输出(默认 60 分钟; 0 = 不限制) */
+    /** 单次维护操作(如 session_compact)的超时毫秒数(默认 60 分钟; 0 = 不限制) */
     taskTimeoutMs?: number;
     /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
     authToken?: string;
