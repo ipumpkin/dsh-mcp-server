@@ -159,6 +159,34 @@ async function call(tool, args, expectError = false) {
   try { return JSON.parse(text) } catch { return { raw: text } }
 }
 
+// 真实持久化会话(段 5/7 用): 现场折叠出"期望末 turn", 断言不写死 turn 号 —— 该会话可能仍在被
+// 其它流程驱动而继续增长; 找不到日志/压缩工具时两段自动跳过, 脚本仍可独立复跑。
+const { execFileSync } = await import('node:child_process')
+const { readdirSync } = await import('node:fs')
+let realFile
+try {
+  for (const p of readdirSync(join(process.env.HOME, '.dsh', 'sessions'))) {
+    const d = join(process.env.HOME, '.dsh', 'sessions', p, REAL_SESSION)
+    try { for (const f of readdirSync(d)) if (/^session(\.v\d+)?\.jsonl\.zstd$/.test(f)) realFile = join(d, f) } catch { /* not here */ }
+  }
+} catch { /* ~/.dsh 不存在 */ }
+let realRows
+let expectLastTurn
+let expectLastKind
+try {
+  if (realFile !== undefined) {
+    realRows = execFileSync('zstd', ['-dc', '--', realFile], { maxBuffer: 512 * 1024 * 1024 }).toString('utf8')
+      .split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l))
+    for (const r of realRows) {
+      if (r.type === 'turn/end') { expectLastTurn = r.data.turn; expectLastKind = r.data.reason ? r.data.reason.kind : null }
+    }
+  }
+} catch { /* zstd 不可用: 跳过真实数据段 */ }
+const HAVE_REAL = realFile !== undefined && typeof expectLastTurn === 'number' && expectLastTurn >= 4
+console.log(HAVE_REAL
+  ? `[真实会话 ${REAL_SESSION}: 末 turn = ${expectLastTurn}(${expectLastKind}), 日志 ${realRows.length} 行]`
+  : `[真实会话 ${REAL_SESSION} 不可用: 段 5/7 将跳过]`)
+
 console.log(`\n== 0) 工具面 (v${VERSION}) ==`)
 const { tools } = await client.listTools()
 const names = tools.map((t) => t.name).sort()
@@ -241,7 +269,7 @@ delete process.env.DSH_HOME
 const cold = await call('session_status', { sessionId: REAL_SESSION })
 ok(cold.live === false && cold.source === 'persisted', '非 live → 冷读持久化日志', { live: cold.live, source: cold.source })
 ok(cold.phase === 'idle', 'phase=idle(末 turn 已闭合)', cold.phase)
-ok(cold.lastTurn?.turn === 4, 'lastTurn.turn = 4', cold.lastTurn)
+ok(cold.lastTurn?.turn === expectLastTurn, `lastTurn.turn = ${expectLastTurn}`, cold.lastTurn)
 ok(cold.lastTurn?.reason?.kind === 'completed', "lastTurn.reason.kind = 'completed'", cold.lastTurn)
 ok(cold.logEvents > 2000, 'logEvents 为整份日志条数', { logEvents: cold.logEvents })
 console.log('    [真实会话 d8bf7cdb 冷读结果]', JSON.stringify({ phase: cold.phase, lastTurn: cold.lastTurn, changes: cold.changes, verification: cold.verification, leftovers: cold.leftovers, lastText: String(cold.lastText).slice(0, 200) }, null, 2))
@@ -254,7 +282,7 @@ const coldCancel = await call('session_cancel', { sessionId: REAL_SESSION })
 ok(coldCancel.live === false && coldCancel.cancelled === false, '冷会话 cancel = noop', coldCancel)
 const coldWait = await call('session_wait', { sessionId: REAL_SESSION, timeoutMs: 30000 })
 ok(coldWait.live === false && coldWait.timeout === false, '非 live session_wait 立即返回(不阻塞)', coldWait.live)
-ok(coldWait.status?.lastTurn?.turn === 4, '非 live wait 直接带 status', coldWait.status?.lastTurn)
+ok(coldWait.status?.lastTurn?.turn === expectLastTurn, '非 live wait 直接带 status', coldWait.status?.lastTurn)
 const missing = await call('session_status', { sessionId: 'does-not-exist-0000' }, true)
 ok(missing.error !== undefined, '未知会话报结构化错误', missing)
 
@@ -284,17 +312,7 @@ delete process.env.DSH_HOME
 
 console.log('\n== 7) 冷读主路径: 官方 sessionPersistence open(id,"read") 尾部窗口 ==')
 // 用真实日志的事件喂一个符合宿主 SessionHandle 契约的假句柄, 验证窗口化读取逻辑。
-const { execFileSync } = await import('node:child_process')
-const { readdirSync } = await import('node:fs')
-const realRoot = join(process.env.HOME, '.dsh', 'sessions')
-let realFile
-for (const p of readdirSync(realRoot)) {
-  const d = join(realRoot, p, REAL_SESSION)
-  try { for (const f of readdirSync(d)) if (/^session(\.v\d+)?\.jsonl\.zstd$/.test(f)) realFile = join(d, f) } catch { /* not here */ }
-}
 ok(typeof realFile === 'string', '定位真实持久化日志文件', realFile)
-const realRows = execFileSync('zstd', ['-dc', '--', realFile], { maxBuffer: 512 * 1024 * 1024 }).toString('utf8')
-  .split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l))
 const realEvents = realRows.filter((r) => r.type !== 'session')
 ok(realEvents.length > 2000, '真实日志事件数 > 2000', { n: realEvents.length })
 
@@ -314,7 +332,7 @@ services.sessionPersistence = {
 }
 const pSt = await call('session_status', { sessionId: REAL_SESSION })
 ok(pSt.source === 'persisted' && pSt.note.includes('source=persistence'), '走 sessionPersistence 主路径(非落盘兜底)', pSt.note)
-ok(pSt.lastTurn?.turn === 4 && pSt.lastTurn?.reason?.kind === 'completed', '窗口化读取仍折叠出 turn 4 completed', pSt.lastTurn)
+ok(pSt.lastTurn?.turn === expectLastTurn && pSt.lastTurn?.reason?.kind === 'completed', `窗口化读取仍折叠出 turn ${expectLastTurn} completed`, pSt.lastTurn)
 ok(pSt.logEvents === realEvents.length, 'logEvents = stat().eventCount', { logEvents: pSt.logEvents, n: realEvents.length })
 ok(reads.length >= 1 && reads[0].offset > 0, '首次读取即取尾部窗口(offset > 0)', reads)
 ok(reads.some((r) => r.length >= 2000), '窗口长度受控(≥2000, 不读全量)', reads.slice(0, 3))
@@ -325,7 +343,7 @@ ok(closed === 2, '每次冷读各自 close', { closed })
 // stat 不可用 → 退化为 read(0) 全量
 services.sessionPersistence.stat = async () => { throw new Error('no metadata') }
 const pSt2 = await call('session_status', { sessionId: REAL_SESSION })
-ok(pSt2.lastTurn?.turn === 4, 'stat 缺失时退化为全量读取仍正确', pSt2.lastTurn)
+ok(pSt2.lastTurn?.turn === expectLastTurn, 'stat 缺失时退化为全量读取仍正确', pSt2.lastTurn)
 ok(reads[reads.length - 1].offset === 0, '退化路径 read(0)', reads[reads.length - 1])
 // open 失败(会话不存在/拒绝) → 落盘兜底
 services.sessionPersistence.open = async () => { throw new Error('not found') }

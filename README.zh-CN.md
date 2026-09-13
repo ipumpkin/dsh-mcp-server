@@ -38,7 +38,7 @@ Hermes 主动轮询: session_status / session_tail (可选 session_wait)
 | `harness_list_tools` | — | 列出 Harness 已注册的工具名 |
 | `harness_status` | Hermes ← Harness | 运维总览：`agentPool`（size / cap / live agents）、`mcpInFlightTurns`（按会话统计 MCP 在飞 turn）与运行时 `config` |
 | `model_list` | Hermes ← Harness | 列出所有已注册 provider 的模型（含已声明未激活的 provider）；`withWindow` 附加上下文窗口 |
-| `mode_list` | Hermes ← Harness | 列出会话**模式**：agent 预设（standard/code/cordis/minimal 等）、沙箱访问模式（read-only/workspace-write/danger-full-access）、审批策略（ask/never）与权限预设（捆绑，如 workspace-write = workspace-write + ask）；`modes` 给出可传给 `session_send` 的 `mode=` 规范 id |
+| `preset_list` | Hermes ← Harness | 列出 **agent preset（会话预设）目录**：主词是 preset 本体（standard/code/cordis/minimal 等，来自 dsh agent-presets），并列出预设定向的其余维度——沙箱访问模式（read-only/workspace-write/danger-full-access）、审批策略（ask/never）与权限预设（捆绑，如 workspace-write = workspace-write + ask）；`modes` 给出可传给 `session_send` 的 `mode=` 规范 id |
 | `workspace_list` | Hermes ← Harness | 列出工作区及其会话分组 |
 | `session_send` | Hermes → Harness | **唯一的派活入口**：把一条任务作为一个 **turn** 投喂进会话并**立即返回**。参数：`sessionId` *或* `cwd`（二选一必填——`sessionId` 续接会话，`cwd` 复用/创建该目录的常驻池会话）、`message`、`context?`、`newSession?`、`title?`、`model?`、`provider?`、`preset?`、`mode?`、`sandbox?`、`approval?`。消息模板 = 记忆 `context` + 【任务】 + 「必须用一行 summary JSON 收尾」。返回 `{sessionId, cwd?, status: "accepted", inboxDepth, openTurn, hint}`——不等待、不超时、绝不阻塞 MCP 客户端 |
 | `session_status` | Hermes ← Harness | **权威查询**（唯一事实源 = session log）：`live`、`source`、`cwd?`、`title?`、`agentStatus?`、`phase`（`idle`/`running`/`waiting_input`/`interrupted`）、`openTurn{turn,startedSeq}`、`lastTurn{turn,reason{kind,error?}}`、`prompts[]`、`context`（events/tokens/pressure/window/ratio；仅 live 可测，非 live 为 `null`）、`logEvents`、`changes`/`verification`/`leftovers`（从最后一个 turn 边界内的 assistant 文本提取，提不到为 `null`）、`lastText`、`note?`。末尾 `turn/start` 无对应 `turn/end` 即报 `phase: "interrupted"`——进程已不在，**不是** `running` |
@@ -87,7 +87,7 @@ DSH 会话的「模式」= 三个独立旋钮 + 它们的命名捆绑：
 | 审批策略 | `ask` / `never` | 会话级覆盖 = `approval/policy` 会话日志事件（`ctx.approval` 提供部署默认） |
 | 权限预设（捆绑） | 如 `workspace-write` = workspace-write + ask、`danger-full-access` = danger-full-access + never | `ctx.permissionPresets` 表 |
 
-`mode_list` 全量枚举上述内容（`only: "preset" | "sandbox" | "approval" | "permission"` 过滤，`withDetail: true` 附带更多元数据），其 `modes` 数组就是 `session_send` 的 `mode=` 可接受的规范 id 空间。创建会话时传 `mode`/`preset`/`sandbox`/`approval` 即在创建时应用该模式（指定即强制全新会话），会话从第一轮起就跑在该模式下、避免 turn 中途再提权；`session_list` 会带 mode 快照验证生效。
+`preset_list` 全量枚举上述内容（`only: "preset" | "sandbox" | "approval" | "permission"` 过滤，`withDetail: true` 附带更多元数据），其 `modes` 数组就是 `session_send` 的 `mode=` 可接受的规范 id 空间。创建会话时传 `mode`/`preset`/`sandbox`/`approval` 即在创建时应用该模式（指定即强制全新会话），会话从第一轮起就跑在该模式下、避免 turn 中途再提权；`session_list` 会带 mode 快照验证生效。
 
 这打通了「客户端持久记忆 ↔ Harness 编码」的回路：记忆作为 `context` 喂给每个 turn，`session_status` 的 `changes` / `verification` / `leftovers` 可以写回客户端记忆，供下次续用。
 
@@ -110,7 +110,7 @@ DSH 会话的「模式」= 三个独立旋钮 + 它们的命名捆绑：
 | `session_send` 传 `sessionId` | 精确续接该会话（多轮投喂 / 断点恢复） |
 | `session_send` 传 `newSession: true` | 本次强制全新会话；旧池会话退役（dispose）但持久化保留，仍可凭其 sessionId 续接 |
 | `session_send` 传 `model` / `provider` | 按次模型覆盖（对新建/resume 会话生效；池复用的会话保持原模型） |
-| `session_send` 传 `mode` / `preset` / `sandbox` / `approval` | 按指定模式创建会话：`preset` 挂载 agent 预设（standard/code/cordis/minimal 等，记入 session header 的 agentPreset）；`mode` 接受 `mode_list.modes` 的任一 id——权限预设名（捆绑，如 workspace-write = workspace-write + ask）、沙箱模式、审批策略或 preset id；`sandbox`/`approval` 显式覆盖捆绑值。指定任一即**强制全新会话**（池会话无法安全套用新模式），沙箱/审批以持久会话日志事件（`sandbox/mode` / `approval/policy`）落盘，会话自第一轮起就跑在该模式下、避免 turn 中途再提权；`session_list` 带 mode 快照验证生效。续接存量 `sessionId` 时 `sandbox`/`approval` 会被拒绝（需新建）；`preset` 单独允许（resume 的 setup 里挂载） |
+| `session_send` 传 `mode` / `preset` / `sandbox` / `approval` | 按指定 preset/模式创建会话：`preset` 挂载 agent preset（会话预设，standard/code/cordis/minimal 等，记入 session header 的 agentPreset）；`mode` 接受 `preset_list.modes` 的任一 id——权限预设名（捆绑，如 workspace-write = workspace-write + ask）、沙箱模式、审批策略或 preset id；`sandbox`/`approval` 显式覆盖捆绑值。指定任一即**强制全新会话**（池会话无法安全套用新模式），沙箱/审批以持久会话日志事件（`sandbox/mode` / `approval/policy`）落盘，会话自第一轮起就跑在该模式下、避免 turn 中途再提权；`session_list` 带 mode 快照验证生效。续接存量 `sessionId` 时 `sandbox`/`approval` 会被拒绝（需新建）；`preset` 单独允许（resume 的 setup 里挂载） |
 | 新会话传 `title`（可选） | 给新会话命名（走 sessionTitle 服务 rename）；**未传时自动按任务内容派生可读名称**（首句截断 ≤60 字符，同一 rename 路径）——新会话开箱即有名字，`session_status` 与 `session_list` 可见 `title`；复用会话不改名 |
 | *(都不传)* | 缺省：复用该 cwd 的常驻池会话 |
 | `session_list` | 盘点池 / live / 持久化三层会话（id、cwd、来源、标题、上下文占用），决定续接哪个 |

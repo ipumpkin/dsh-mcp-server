@@ -15,7 +15,7 @@
  *   - harness_list_tools  : 列出 Harness 工具注册表
  *   - harness_status      : 系统水位总览(agent 池/live 会话/运行时配置)
  *   - model_list          : 列出 provider 的模型目录, 供按任务选模型
- *   - mode_list           : 列出会话模式目录(agent preset / 沙箱访问模式 / 审批策略 / 权限预设)
+ *   - preset_list         : 列出 agent preset(会话预设)目录, 并列出与预设定向相关的其余维度(沙箱访问模式 / 审批策略 / 权限预设)
  *   - workspace_list      : 列出工作区及其会话分组
  *   - session_send        : 【派活入口】把一条任务作为一个 turn 投喂进会话, 立即返回(不阻塞)
  *   - session_status      : 【主动查询】phase/openTurn/lastTurn/prompts/context/summary, 以 session log 为准
@@ -37,7 +37,7 @@
  * workspace-write / danger-full-access, 会话级覆盖 = sandbox/mode 日志事件)+ 审批策略(ask / never,
  * 覆盖 = approval/policy 日志事件)。权限预设(ctx.permissionPresets)把沙箱+审批捆绑命名(如
  * workspace-write = workspace-write + ask)。session_send 传 preset/mode/sandbox/approval 可在
- * 创建会话时应用模式(指定即强制全新会话, 避免后续再提权); mode_list 列出可用模式。
+ * 创建会话时应用(指定即强制全新会话, 避免后续再提权); preset_list 列出可用 preset 及其定向的其余维度。
  *
  * 上下文占用: session_list 与 session_status(仅 live)经 ctx.tokenMeter.measure(session) 输出事件数与
  * 启发式 token 数(固定密度定价, 与 dsh token-meter 同源), 并经 ctx.llm.resolveModelInfo 解析模型
@@ -68,7 +68,7 @@ import type { Context } from '@deepseek-ai/cordis';
 /** Cordis 插件名 */
 export declare const name = "harness-mcp-server";
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export declare const VERSION = "0.11.0";
+export declare const VERSION = "0.12.0";
 /**
  * 声明依赖的核心服务。
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——

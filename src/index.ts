@@ -15,7 +15,7 @@
  *   - harness_list_tools  : 列出 Harness 工具注册表
  *   - harness_status      : 系统水位总览(agent 池/live 会话/运行时配置)
  *   - model_list          : 列出 provider 的模型目录, 供按任务选模型
- *   - mode_list           : 列出会话模式目录(agent preset / 沙箱访问模式 / 审批策略 / 权限预设)
+ *   - preset_list         : 列出 agent preset(会话预设)目录, 并列出与预设定向相关的其余维度(沙箱访问模式 / 审批策略 / 权限预设)
  *   - workspace_list      : 列出工作区及其会话分组
  *   - session_send        : 【派活入口】把一条任务作为一个 turn 投喂进会话, 立即返回(不阻塞)
  *   - session_status      : 【主动查询】phase/openTurn/lastTurn/prompts/context/summary, 以 session log 为准
@@ -37,7 +37,7 @@
  * workspace-write / danger-full-access, 会话级覆盖 = sandbox/mode 日志事件)+ 审批策略(ask / never,
  * 覆盖 = approval/policy 日志事件)。权限预设(ctx.permissionPresets)把沙箱+审批捆绑命名(如
  * workspace-write = workspace-write + ask)。session_send 传 preset/mode/sandbox/approval 可在
- * 创建会话时应用模式(指定即强制全新会话, 避免后续再提权); mode_list 列出可用模式。
+ * 创建会话时应用(指定即强制全新会话, 避免后续再提权); preset_list 列出可用 preset 及其定向的其余维度。
  *
  * 上下文占用: session_list 与 session_status(仅 live)经 ctx.tokenMeter.measure(session) 输出事件数与
  * 启发式 token 数(固定密度定价, 与 dsh token-meter 同源), 并经 ctx.llm.resolveModelInfo 解析模型
@@ -93,7 +93,7 @@ import { join, resolve } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.11.0"
+export const VERSION = "0.12.0"
 
 /**
  * 声明依赖的核心服务。
@@ -953,7 +953,7 @@ async function resolveModeRequest(ctx: Context, input: { mode?: string; preset?:
   return out
 }
 
-/** agentPresets.list 的 id 清单(服务/方法缺失时返回空; 供报错提示与 mode_list 汇总) */
+/** agentPresets.list 的 id 清单(服务/方法缺失时返回空; 供报错提示与 preset_list 汇总) */
 async function listPresetIds(ctx: Context): Promise<string[]> {
   const agentPresets = ctx.get('agentPresets') as AgentPresetsView | undefined
   try {
@@ -1743,14 +1743,15 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
-  // 模式目录: 会话「模式」= agent preset(standard/code/cordis 等) + 沙箱访问模式(read-only/workspace-write/
+  // preset 目录: DSH 的会话术语是 **agent preset**(会话预设, standard/code/cordis/minimal 等, 来自 dsh
+  // agent-presets), 它是主词; 与「预设定向」相关的其余维度并列列出 —— 沙箱访问模式(read-only/workspace-write/
   // danger-full-access) + 审批策略(ask/never) + 权限预设(捆绑沙箱+审批, 如 workspace-write = workspace-write+ask)。
   // modes 汇总给出可传给 session_send 的 mode= 规范 id(按类别), 与 model_list 的枚举姿势一致:
   // presets 经 ctx.agentPresets.list() 实时枚举, 沙箱/审批词汇固定, 默认值经 ctx.sandboxPolicy / ctx.approval /
   // ctx.permissionPresets(服务缺省时给安全回退)。withDetail=true 附带更多元数据与部署默认。
   mcp.tool(
-    'mode_list',
-    '列出可用会话模式: agent preset(standard/code/cordis/minimal 等, 来自 dsh agent-presets) + 沙箱访问模式(read-only/workspace-write/danger-full-access) + 审批策略(ask/never) + 权限预设(捆绑沙箱+审批, 如 workspace-write = workspace-write + ask)。modes 汇总给出可传给 session_send 的 mode= 规范 id; 传 only 只列某一类。',
+    'preset_list',
+    '列出 agent preset(会话预设)目录: preset 本体(standard/code/cordis/minimal 等, 来自 dsh agent-presets, 主词), 以及预设定向的其余维度 —— 沙箱访问模式(read-only/workspace-write/danger-full-access) + 审批策略(ask/never) + 权限预设(捆绑沙箱+审批, 如 workspace-write = workspace-write + ask)。modes 汇总给出可传给 session_send 的 mode= 规范 id; 传 only 只列某一类(preset 为缺省关注点)。',
     {
       only: z.enum(['preset', 'sandbox', 'approval', 'permission']).optional().describe('只列出某一类(preset/sandbox/approval/permission); 缺省列全部'),
       withDetail: z.boolean().optional().describe('true = 附带详细字段(preset 路径/顺序/损坏原因, 部署默认, 每个 mode 的语义/适用场景)'),
@@ -1964,7 +1965,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       model: z.string().optional().describe('本次使用的模型 id(对新建/resume 会话生效; 池复用的会话保持原模型)'),
       provider: z.string().optional().describe('本次使用的 provider 路由(默认 deepseek-official)'),
       preset: z.string().optional().describe('agent preset id(standard/code/cordis/minimal 等): 新建时挂载并写进 session header; resume 存量会话时也允许(在 setup 挂载该 preset)'),
-      mode: z.string().optional().describe('会话模式(仅新建会话时应用; 指定即强制全新会话)。取值见 mode_list 的 modes: 权限预设名(如 workspace-write = 沙箱 workspace-write + 审批 ask) 或沙箱模式(read-only/workspace-write/danger-full-access) 或审批策略(ask/never) 或 agent preset id'),
+      mode: z.string().optional().describe('会话模式(仅新建会话时应用; 指定即强制全新会话)。取值见 preset_list 的 modes: 权限预设名(如 workspace-write = 沙箱 workspace-write + 审批 ask) 或沙箱模式(read-only/workspace-write/danger-full-access) 或审批策略(ask/never) 或 agent preset id'),
       sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('沙箱访问模式(显式指定, 覆盖 mode 捆绑里的值; 仅新建会话时应用)'),
       approval: z.enum(['ask', 'never']).optional().describe('审批策略(显式指定, 覆盖 mode 捆绑里的值; 仅新建会话时应用)'),
     },
