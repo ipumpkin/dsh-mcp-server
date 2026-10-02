@@ -1,4 +1,4 @@
-# dsh-harness-mcp-server
+# dsh-mcp-server
 
 > 把 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 agent 能力暴露成一个 **MCP server**，让任意 MCP 客户端（如 [Hermes](https://hermes-agent.nousresearch.com/)）都能驱动 Harness 执行真实的编码任务。
 
@@ -19,7 +19,7 @@ Harness 自带强大的 agent 运行时（工具、LLM、agent、会话），但
 Hermes (MCP 客户端, 大脑)
    │  session_send → { sessionId, status: "accepted" }   (HTTP, 立即返回)
    ▼
-dsh-harness-mcp-server (MCP server, :8090)
+dsh-mcp-server (MCP server, :8090)
    │  ctx.agents.create → 挂载 'standard' preset → agent.followup() 一个 turn
    ▼
 Harness agent (flash) — 完整工具集: bash、fs、todo、web…

@@ -1,6 +1,6 @@
 {
   "name": "@ipumpkin/dsh-mcp-server",
-  "version": "0.13.0",
+  "version": "0.2.0",
   "description": "Expose DeepSeek Harness agent capabilities as an MCP server, so an external MCP client (e.g. Hermes) can drive Harness to execute coding tasks. Hermes = brain, Harness = arms.",
   "type": "module",
   "main": "lib/index.js",
@@ -28,11 +28,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ipumpkin/dsh-harness-mcp-server.git"
+    "url": "git+https://github.com/ipumpkin/dsh-mcp-server.git"
   },
-  "homepage": "https://github.com/ipumpkin/dsh-harness-mcp-server#readme",
+  "homepage": "https://github.com/ipumpkin/dsh-mcp-server#readme",
   "bugs": {
-    "url": "https://github.com/ipumpkin/dsh-harness-mcp-server/issues"
+    "url": "https://github.com/ipumpkin/dsh-mcp-server/issues"
   },
   "dsh": {
     "bundle": {

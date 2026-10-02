@@ -1,4 +1,4 @@
-# dsh-harness-mcp-server
+# dsh-mcp-server
 
 > Expose [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agent capabilities as an **MCP server**, letting any MCP client (e.g. [Hermes](https://hermes-agent.nousresearch.com/)) drive Harness to execute real coding tasks.
 
@@ -17,7 +17,7 @@ Since **0.11.0** dispatch is **session + turn**, not a task queue: `session_send
 Hermes (MCP client, brain)
    │  session_send → { sessionId, status: "accepted" }   (HTTP, returns at once)
    ▼
-dsh-harness-mcp-server (MCP server, :8090)
+dsh-mcp-server (MCP server, :8090)
    │  ctx.agents.create → mount 'standard' preset → agent.followup() one turn
    ▼
 Harness agent (flash) — full toolset: bash, fs, todo, web…
