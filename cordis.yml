@@ -1,0 +1,16 @@
+# --patch / bundle 清单加载插件: 在 Harness 内部启动 MCP server(8090), 暴露能力给外部 MCP 客户端(Hermes)
+# 要求 dsh >= 0.1.1-rc.2(@deepseek-ai/* 为 peerDependencies, 与宿主共享单一副本)
+- insert:
+    - id: harness-mcp-server
+      name: '@chushixixin/dsh-harness-mcp-server'
+      config:
+        http: true
+        port: 8090
+        host: 127.0.0.1        # 默认仅本机; 暴露公网前必须加认证(authToken)+反代+TLS
+        # taskTimeoutMs: 3600000   # 可选: 单任务超时毫秒数(默认 60 分钟, 0 = 不限制)
+        # authToken: 'your-secret-token'     # 可选: Bearer token 认证(设置后所有请求必须带)
+        # workspaceRoots: ['/workspace']      # 可选: cwd 白名单(防路径穿越)
+        # preset: 'standard'                  # 可选: setup 挂载的 agent preset
+        # maxAgents: 8                        # 可选: 常驻 agent 会话上限(LRU 淘汰)
+        # maxQueue: 100                       # 可选: 异步任务队列容量
+        # taskTtlMs: 3600000                   # 可选: 已完成任务保留毫秒数(默认 60 分钟)
