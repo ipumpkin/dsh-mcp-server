@@ -1,8 +1,8 @@
 # --patch / bundle 清单加载插件: 在 Harness 内部启动 MCP server(8090), 暴露能力给外部 MCP 客户端(Hermes)
-# 要求 dsh >= 0.1.1-rc.2(@deepseek-ai/* 为 peerDependencies, 与宿主共享单一副本)
+# 要求 dsh >= 0.2.0-rc.1(@deepseek-ai/* 为 peerDependencies, 与宿主共享单一副本)
 - insert:
     - id: harness-mcp-server
-      name: '@chushixixin/dsh-harness-mcp-server'
+      name: '@ipumpkin/dsh-mcp-server'
       config:
         http: true
         port: 8090

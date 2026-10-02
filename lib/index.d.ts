@@ -1,7 +1,7 @@
 /**
  * dsh-harness-mcp-server — 在 Harness 内部启动 MCP server, 暴露 Harness 能力给 Hermes(大脑)。
  *
- * 适配 dsh >= 0.1.1-rc.2(rc.6 的 agent ctx 丢 scope 问题已在上游修复)。
+ * 适配 dsh >= 0.2.0-rc.1(rc.6 的 agent ctx 丢 scope 问题已在上游修复)。
  *
  * 架构(v0.11.0): 「任务」层已降维为 **session + turn** —— 不再有 taskId/任务队列/内存态任务结果。
  *  - 派活 = 往一个会话投喂一个 turn: session_send 组装 message 后 agent.followup() 立即返回(不等待/不超时阻塞)。
@@ -32,7 +32,7 @@
  *   - attach_session      : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session      : 给已有会话改名
  *
- * 会话模式: DSH 会话的「模式」= agent 预设(standard/code/cordis/minimal 等, 来自 dsh agent-presets,
+ * 会话模式: DSH 会话的「模式」= agent 预设(standard/code/cordis/minimal 等, 来自 dsh-agent-preset-registry,
  * 经 ctx.agentPresets.mount 挂载, meta.agentPreset 记入 session header)+ 沙箱访问模式(read-only /
  * workspace-write / danger-full-access, 会话级覆盖 = sandbox/mode 日志事件)+ 审批策略(ask / never,
  * 覆盖 = approval/policy 日志事件)。权限预设(ctx.permissionPresets)把沙箱+审批捆绑命名(如
@@ -65,39 +65,58 @@
  *       → session_status/session_tail 主动查询 → Hermes 持久化
  */
 import type { Context } from '@deepseek-ai/cordis';
+import type { ContextFormed } from '@deepseek-ai/dsh-llm';
+import schemastery from '@deepseek-ai/schemastery';
+declare module '@deepseek-ai/dsh-llm' {
+    interface MessageSourceMap {
+        'harness-mcp-server': {
+            kind: 'harness-mcp-server';
+        } & ContextFormed;
+    }
+}
 /** Cordis 插件名 */
 export declare const name = "harness-mcp-server";
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export declare const VERSION = "0.12.1";
+export declare const VERSION = "0.13.0";
 /**
  * 声明依赖的核心服务。
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——
  * 漏声明会在真实启动时拿不到服务(本插件曾经踩过, 务必与代码里的 ctx.get 对齐)。
  */
 export declare const inject: string[];
-/** 插件配置 */
-export interface Config {
-    http?: boolean;
-    port?: number;
-    host?: string;
-    /** 后端 provider(默认 deepseek-official) */
-    provider?: string;
-    /** 执行任务的模型(默认 deepseek-v4-flash) */
-    model?: string;
-    /** 挂载的 agent preset(默认 standard) */
-    preset?: string;
-    /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
-    maxAgents?: number;
-    /** 单次维护操作(如 session_compact)的超时毫秒数(默认 60 分钟; 0 = 不限制) */
-    taskTimeoutMs?: number;
-    /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
-    authToken?: string;
-    /** Bearer token 列表(任一命中即放行; 与 authToken 并存, 适合多客户端各自持一个 token) */
-    authTokens?: string[];
-    /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
-    workspaceRoots?: string[];
-}
+/**
+ * 插件配置 schema(dsh 0.2.0 形态): 命名空间 = profile 条目 id(`harness-mcp-server`)。
+ * 只有 `.volatile()` 字段会进自动生成的设置表单, 并可在设置页热改; 其余字段仍只从入口 config 读。
+ * 类型 `Config` 由 schema 推导(`Schemastery.TypeT`), 供 apply 签名等内部使用。
+ */
+export declare const Config: schemastery<Schemastery.ObjectS<NoInfer<{
+    http: schemastery<boolean, boolean, "defined">;
+    port: schemastery<number, number, "volatile-defined">;
+    host: schemastery<string, string, "volatile-defined">;
+    provider: schemastery<string, string, "defined">;
+    model: schemastery<string, string, "defined">;
+    preset: schemastery<string, string, "defined">;
+    maxAgents: schemastery<number, number, "defined">;
+    taskTimeoutMs: schemastery<number, number, "defined">;
+    authToken: schemastery<string, string, "volatile-defined">;
+    authTokens: schemastery<string[], string[], "defined">;
+    workspaceRoots: schemastery<string[], string[], "defined">;
+}>>, Schemastery.ObjectT<NoInfer<{
+    http: schemastery<boolean, boolean, "defined">;
+    port: schemastery<number, number, "volatile-defined">;
+    host: schemastery<string, string, "volatile-defined">;
+    provider: schemastery<string, string, "defined">;
+    model: schemastery<string, string, "defined">;
+    preset: schemastery<string, string, "defined">;
+    maxAgents: schemastery<number, number, "defined">;
+    taskTimeoutMs: schemastery<number, number, "defined">;
+    authToken: schemastery<string, string, "volatile-defined">;
+    authTokens: schemastery<string[], string[], "defined">;
+    workspaceRoots: schemastery<string[], string[], "defined">;
+}>>, "plain">;
+/** 插件配置类型: 从上面的 schema 推导(volatile 字段为 `Volatile<T>`, 经 `.get()` 读取)。 */
+export type Config = Schemastery.TypeT<typeof Config>;
 /**
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。
  */
-export declare function apply(ctx: Context, config?: Config): Promise<void>;
+export declare function apply(ctx: Context, config?: Partial<Config>): Promise<void>;

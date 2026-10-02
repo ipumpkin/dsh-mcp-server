@@ -4,8 +4,8 @@
 
 **Hermes 是大脑（pro），Harness 是胳膊（flash）—— 1+1>2。**
 
-[![npm version](https://img.shields.io/npm/v/@chushixixin/dsh-harness-mcp-server)](https://www.npmjs.com/package/@chushixixin/dsh-harness-mcp-server)
-[![license](https://img.shields.io/npm/l/@chushixixin/dsh-harness-mcp-server)](./LICENSE)
+[![npm version](https://img.shields.io/npm/v/@ipumpkin/dsh-mcp-server)](https://www.npmjs.com/package/@ipumpkin/dsh-mcp-server)
+[![license](https://img.shields.io/npm/l/@ipumpkin/dsh-mcp-server)](./LICENSE)
 
 > 📖 [English](./README.md) · 中文（当前页）
 
@@ -169,7 +169,7 @@ MCP 拦截审批/提问后，web 会话界面会收到两条折叠提示行（`f
 
 ```bash
 cd ~/.dsh/profiles/web      # 换成你实际使用的 profile(dsh-tui / headless / web)
-pnpm add @chushixixin/dsh-harness-mcp-server
+pnpm add @ipumpkin/dsh-mcp-server
 ```
 
 然后在 `~/.dsh/profiles/web/package.json` 的 bundle 列表里注册：
@@ -180,7 +180,7 @@ pnpm add @chushixixin/dsh-harness-mcp-server
     "bundles": [
       "@deepseek-ai/dsh-base",
       "@deepseek-ai/dsh-web-app",
-      "@chushixixin/dsh-harness-mcp-server"
+      "@ipumpkin/dsh-mcp-server"
     ]
   }
 }
@@ -191,7 +191,7 @@ pnpm add @chushixixin/dsh-harness-mcp-server
 ### 方式 B —— `--patch` overlay
 
 ```bash
-dsh web --patch ~/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server/cordis.yml
+dsh web --patch ~/.dsh/profiles/web/node_modules/@ipumpkin/dsh-mcp-server/cordis.yml
 ```
 
 （可重复：`--patch a.yml --patch b.yml`。）
@@ -240,14 +240,14 @@ printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
 | `authTokens` | *(无)* | 额外 Bearer token 列表（数组，任一命中即放行）——与 `authToken` 并存，适合给每个客户端发独立 token |
 | `workspaceRoots` | *(无)* | cwd 白名单——设置后任务只能在列出的目录下运行（attach_session 的归组目标同样校验） |
 
-> 设置页需要 dsh **web** surface：它经 web settings 文档写入，并以浏览器 bundle 形式分发。没有 settings 服务的 surface（如 headless）宿主半区照常工作，仅缺此页。若宿主行正常但设置导航里始终不出现「MCP Server」页，是部署未解析到浏览器 bundle：把已安装的包链接进宿主安装目录的 `node_modules`（或 `~/.dsh/profiles/node_modules`），例如 `ln -s ~/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server <宿主安装>/node_modules/@chushixixin/dsh-harness-mcp-server`，然后重启。
+> 设置页需要 dsh **web** surface：它经 web settings 文档写入，并以浏览器 bundle 形式分发。没有 settings 服务的 surface（如 headless）宿主半区照常工作，仅缺此页。若宿主行正常但设置导航里始终不出现「MCP Server」页，是部署未解析到浏览器 bundle：把已安装的包链接进宿主安装目录的 `node_modules`（或 `~/.dsh/profiles/node_modules`），例如 `ln -s ~/.dsh/profiles/web/node_modules/@ipumpkin/dsh-mcp-server <宿主安装>/node_modules/@ipumpkin/dsh-mcp-server`，然后重启。
 
 ### cordis.yml（patch 格式）
 
 ```yaml
 - insert:
     - id: harness-mcp-server
-      name: '@chushixixin/dsh-harness-mcp-server'
+      name: '@ipumpkin/dsh-mcp-server'
       config:
         http: true
         port: 8090

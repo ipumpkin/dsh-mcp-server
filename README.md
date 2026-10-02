@@ -4,8 +4,8 @@
 
 **Hermes is the brain (pro), Harness is the arms (flash) — 1+1>2.**
 
-[![npm version](https://img.shields.io/npm/v/@chushixixin/dsh-harness-mcp-server)](https://www.npmjs.com/package/@chushixixin/dsh-harness-mcp-server)
-[![license](https://img.shields.io/npm/l/@chushixixin/dsh-harness-mcp-server)](./LICENSE)
+[![npm version](https://img.shields.io/npm/v/@ipumpkin/dsh-mcp-server)](https://www.npmjs.com/package/@ipumpkin/dsh-mcp-server)
+[![license](https://img.shields.io/npm/l/@ipumpkin/dsh-mcp-server)](./LICENSE)
 
 ## Why this exists
 
@@ -167,7 +167,7 @@ When a session's context gets too large, compress it:
 
 ```bash
 cd ~/.dsh/profiles/web      # or whichever profile you run (dsh-tui / headless / web)
-pnpm add @chushixixin/dsh-harness-mcp-server
+pnpm add @ipumpkin/dsh-mcp-server
 ```
 
 Then add it to the profile's bundle list in `~/.dsh/profiles/web/package.json`:
@@ -178,7 +178,7 @@ Then add it to the profile's bundle list in `~/.dsh/profiles/web/package.json`:
     "bundles": [
       "@deepseek-ai/dsh-base",
       "@deepseek-ai/dsh-web-app",
-      "@chushixixin/dsh-harness-mcp-server"
+      "@ipumpkin/dsh-mcp-server"
     ]
   }
 }
@@ -189,7 +189,7 @@ The package ships a `dsh.bundle.patch` manifest (`cordis.yml`), so it mounts aut
 ### Option B — `--patch` overlay
 
 ```bash
-dsh web --patch ~/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server/cordis.yml
+dsh web --patch ~/.dsh/profiles/web/node_modules/@ipumpkin/dsh-mcp-server/cordis.yml
 ```
 
 (Repeatable: `--patch a.yml --patch b.yml`.)
@@ -238,14 +238,14 @@ Two layers, resolved in order (schema default → entry-config base → user lay
 | `authTokens` | *(none)* | Additional Bearer tokens (array; any match authorizes) — coexists with `authToken`, handy to give each client its own token |
 | `workspaceRoots` | *(none)* | cwd whitelist — when set, tasks may only run under these directories (`attach_session` targets are validated against it too) |
 
-> The settings page needs the dsh **web** surface: it writes through the web settings document and ships as a browser bundle. On surfaces without the settings service (e.g. headless) the host half works unchanged — only the page is absent. If the host row runs but the page never appears in the web settings nav, the client bundle could not be resolved by the deployment: link the installed package into the host installation's `node_modules` (or `~/.dsh/profiles/node_modules`), e.g. `ln -s ~/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server <host-install>/node_modules/@chushixixin/dsh-harness-mcp-server`, then restart.
+> The settings page needs the dsh **web** surface: it writes through the web settings document and ships as a browser bundle. On surfaces without the settings service (e.g. headless) the host half works unchanged — only the page is absent. If the host row runs but the page never appears in the web settings nav, the client bundle could not be resolved by the deployment: link the installed package into the host installation's `node_modules` (or `~/.dsh/profiles/node_modules`), e.g. `ln -s ~/.dsh/profiles/web/node_modules/@ipumpkin/dsh-mcp-server <host-install>/node_modules/@ipumpkin/dsh-mcp-server`, then restart.
 
 ### cordis.yml (patch format)
 
 ```yaml
 - insert:
     - id: harness-mcp-server
-      name: '@chushixixin/dsh-harness-mcp-server'
+      name: '@ipumpkin/dsh-mcp-server'
       config:
         http: true
         port: 8090

@@ -35,6 +35,9 @@ function makeSession(id, cwd) {
   const session = {
     id, header: { id, cwd, agentPreset: 'standard' }, log,
     append(type, data) { log.push({ type, seq: seq++, time: Date.now(), data }); emit('session/event', session, log[log.length - 1]); return seq },
+    // 0.2 形状: Session 没有公开 events 属性、log 私有, 同步读走 snapshotEvents()/eventAt()(已废弃但可用)
+    snapshotEvents: () => log,
+    eventAt: (s) => log[s],
   }
   return session
 }
@@ -66,12 +69,14 @@ function makeAgent(session, { turnMs = 40 } = {}) {
       const push = (fn, delay) => { const t = setTimeout(() => { timers.delete(t); fn() }, delay); timers.add(t) }
       push(() => { session.append('step/start', { turn, step: 1 }) }, ms * 0.2)
       push(() => {
-        session.append('user/message', { message: { role: 'user', content: [{ type: 'text', text: this._pendingText.slice(0, 400) }] }, source: { kind: 'plugin', plugin: 'harness-mcp-server' } })
+        // 0.2 形状: user/message 的 data 就是 UserMessage 本体(content 直接在 data 上, 不再包 {message})
+        session.append('user/message', { role: 'user', content: [{ type: 'text', text: this._pendingText.slice(0, 400) }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } })
         session.append('assistant/chunk', { chunk: { type: 'text', text: 'x'.repeat(50) } }) // 内部流式事件: tail 必须滤掉
       }, ms * 0.4)
       push(() => {
         if (this._cancelled) return
-        session.append('assistant/message', { message: { role: 'assistant', content: [
+        // 0.2 形状: assistant/message 的 data 是 {turn, step, message}
+        session.append('assistant/message', { turn, step: 1, message: { role: 'assistant', content: [
           { type: 'text', text: 'hi from echo\n{"changes":"echo hi 已执行","verification":"exit 0; 输出 hi","leftovers":"none"}' },
           { type: 'tool_use', name: 'bash' }, // 非文本块: 不能被当成 "(no text blocks)"
         ] } })
@@ -136,7 +141,8 @@ const services = {
 }
 
 const ctx = {
-  tools: { keys: () => ['bash', 'fs_read', 'fs_write'] },
+  // 0.2 形状: tools 服务没有 keys(), 用 schemas() 拿 ToolSchema[](name 在 schema 上)
+  tools: { schemas: () => [{ name: 'bash' }, { name: 'fs_read' }, { name: 'fs_write' }] },
   agents: agentsSvc,
   get: (n) => services[n],
   on: (name, fn) => on(name, fn),
@@ -195,6 +201,9 @@ const removed = ['agent_run', 'task_inbox', 'task_result', 'task_list', 'task_wa
 ok(required.every((n) => names.includes(n)), '新增 5 个 session_* 工具', names)
 ok(removed.every((n) => !names.includes(n)), '旧 6 个 task/agent_run 工具已同版删除', names)
 ok(names.length === 20, '工具总数 = 20(5 新增 + 15 保留; session_close 已删除)', { count: names.length, names })
+// 回归(修复 3): 0.2 的 tools 服务没有 keys(), harness_list_tools 改走 schemas().map(name)
+const listed = await call('harness_list_tools', {})
+ok(Array.isArray(listed) && ['bash', 'fs_read', 'fs_write'].every((n) => listed.includes(n)), 'harness_list_tools 读到 schemas() 的工具名', listed)
 
 console.log('\n== 1) session_send 立即返回 + 主动查询到 completed ==')
 const t0 = Date.now()
@@ -228,6 +237,11 @@ ok(tail.source === 'live', 'source=live', tail)
 const kinds = tail.events.map((e) => e.type)
 ok(kinds.includes('turn/start') && kinds.includes('turn/end'), 'tail 含 turn 边界', kinds)
 ok(kinds.includes('assistant/message') && kinds.includes('user/message'), 'tail 含 user/assistant 文本消息', kinds)
+// 回归(修复 2): 0.2 的 user/message data 就是 UserMessage —— 用户消息文本必须直读出来
+const userRow = tail.events.find((e) => e.type === 'user/message')
+ok(userRow !== undefined && userRow.text.includes('echo hi'), 'user/message 直读 data.content(0.2 形状)', userRow)
+const asstRow = tail.events.find((e) => e.type === 'assistant/message')
+ok(asstRow !== undefined && asstRow.text.startsWith('hi from echo'), 'assistant/message 仍读 data.message.content', asstRow)
 ok(!kinds.includes('assistant/chunk') && !kinds.includes('step/start'), 'tail 滤除内部流式/step 事件', kinds)
 ok(!tail.events.some((e) => e.text === '(no text blocks)'), 'tail 无 "(no text blocks)" 噪声', tail.events.map((e) => e.text))
 ok(tail.events.every((e) => typeof e.text === 'string' && e.text.length <= 2000), 'text 统一 ≤2k', tail.events.map((e) => e.text.length))
@@ -328,7 +342,10 @@ services.sessionPersistence = {
     },
     close: async () => { closed++ },
   }),
-  list: async () => [{ id: REAL_SESSION, cwd: '/home/ziqiang/code/gitc-mainsite', agentPreset: 'standard' }],
+  list: async () => [
+    // 回归(修复 1): 0.2 的 list() 行是 { header, revision, ... } —— id/cwd/agentPreset 都在 row.header 上
+    { header: { id: REAL_SESSION, cwd: '/home/ziqiang/code/gitc-mainsite', agentPreset: 'standard' }, revision: 1 },
+  ],
 }
 const pSt = await call('session_status', { sessionId: REAL_SESSION })
 ok(pSt.source === 'persisted' && pSt.note.includes('source=persistence'), '走 sessionPersistence 主路径(非落盘兜底)', pSt.note)
@@ -340,6 +357,10 @@ ok(closed === 1, 'read 句柄被 close(不留悬挂句柄)', { closed })
 const pTail = await call('session_tail', { sessionId: REAL_SESSION, n: 3 })
 ok(pTail.source === 'persisted' && pTail.events.length === 3, 'session_tail 复用主路径', { source: pTail.source, n: pTail.events.length })
 ok(closed === 2, '每次冷读各自 close', { closed })
+// 回归(修复 1): session_list 的持久化层从 0.2 行形状 {header} 里取 id/cwd/agentPreset
+const sList = await call('session_list', {})
+const pRow = sList.sessions?.find((s) => s.sessionId === REAL_SESSION && s.source === 'persisted')
+ok(pRow !== undefined && pRow.cwd === '/home/ziqiang/code/gitc-mainsite', 'session_list 持久化行经 row.header 取 id/cwd', pRow)
 // stat 不可用 → 退化为 read(0) 全量
 services.sessionPersistence.stat = async () => { throw new Error('no metadata') }
 const pSt2 = await call('session_status', { sessionId: REAL_SESSION })
@@ -350,6 +371,28 @@ services.sessionPersistence.open = async () => { throw new Error('not found') }
 const pSt3 = await call('session_status', { sessionId: REAL_SESSION })
 ok(pSt3.note.includes('source=file'), 'open 抛错 → 落盘 zstd 兜底', pSt3.note)
 delete services.sessionPersistence
+
+console.log('\n== 8) 生效 sandbox/approval 模式: 服务 override → 事件折叠加 → 部署默认 三层回退 ==')
+// 0.2 依据: Session 无公开 events 属性(log 私有); 服务上有公开的 overrideOf(session) 折叠加读取。
+// 回归(修复 4a) 层③: 无服务、无事件 → 部署默认
+const agent1 = agentsById.get(sid)
+const sl0 = await call('session_list', {})
+const mode0 = sl0.sessions?.find((s) => s.sessionId === sid)?.mode
+ok(mode0?.sandbox === 'read-only' && mode0?.approval === 'ask', '层③ 无服务无事件 → 部署默认 read-only/ask', mode0)
+// 层②: 服务缺失 → snapshotEvents() 扫最后一条 sandbox/mode / approval/policy(最后一条生效)
+agent1.session.append('sandbox/mode', { mode: 'workspace-write' })
+agent1.session.append('approval/policy', { policy: 'never' })
+agent1.session.append('sandbox/mode', { mode: 'danger-full-access' }) // 再追加一条: 最后一条生效
+const mode1 = (await call('session_list', {})).sessions?.find((s) => s.sessionId === sid)?.mode
+ok(mode1?.sandbox === 'danger-full-access', '层② snapshotEvents() 折叠加 sandbox/mode(最后一条生效)', mode1)
+ok(mode1?.approval === 'never', '层② snapshotEvents() 折叠加 approval/policy', mode1)
+// 层①: 服务 overrideOf 优先于事件折叠加
+services.sandboxPolicy = { defaultMode: 'read-only', overrideOf: () => 'workspace-write' }
+services.approval = { config: { policy: 'ask' }, overrideOf: () => 'ask' }
+const mode2 = (await call('session_list', {})).sessions?.find((s) => s.sessionId === sid)?.mode
+ok(mode2?.sandbox === 'workspace-write' && mode2?.approval === 'ask', '层① ctx.sandboxPolicy/ctx.approval.overrideOf 优先', mode2)
+delete services.sandboxPolicy
+delete services.approval
 
 console.log(`\n── 结果: ${pass} passed, ${fail} failed ──`)
 await client.close()

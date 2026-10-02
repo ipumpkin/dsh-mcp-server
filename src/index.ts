@@ -1,7 +1,7 @@
 /**
  * dsh-harness-mcp-server — 在 Harness 内部启动 MCP server, 暴露 Harness 能力给 Hermes(大脑)。
  *
- * 适配 dsh >= 0.1.1-rc.2(rc.6 的 agent ctx 丢 scope 问题已在上游修复)。
+ * 适配 dsh >= 0.2.0-rc.1(rc.6 的 agent ctx 丢 scope 问题已在上游修复)。
  *
  * 架构(v0.11.0): 「任务」层已降维为 **session + turn** —— 不再有 taskId/任务队列/内存态任务结果。
  *  - 派活 = 往一个会话投喂一个 turn: session_send 组装 message 后 agent.followup() 立即返回(不等待/不超时阻塞)。
@@ -32,7 +32,7 @@
  *   - attach_session      : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session      : 给已有会话改名
  *
- * 会话模式: DSH 会话的「模式」= agent 预设(standard/code/cordis/minimal 等, 来自 dsh agent-presets,
+ * 会话模式: DSH 会话的「模式」= agent 预设(standard/code/cordis/minimal 等, 来自 dsh-agent-preset-registry,
  * 经 ctx.agentPresets.mount 挂载, meta.agentPreset 记入 session header)+ 沙箱访问模式(read-only /
  * workspace-write / danger-full-access, 会话级覆盖 = sandbox/mode 日志事件)+ 审批策略(ask / never,
  * 覆盖 = approval/policy 日志事件)。权限预设(ctx.permissionPresets)把沙箱+审批捆绑命名(如
@@ -69,12 +69,13 @@
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
@@ -89,11 +90,18 @@ import { homedir } from 'node:os'
 import http from 'node:http'
 import { join, resolve } from 'node:path'
 
+// ── 消息来源模块合并: dsh 0.2.0 起 MessageSourceMap 无兜底 'plugin' kind, ──
+// 每个生产者在自己模块里声明自己的 kind(dsh 官方做法, 见 dsh-plan-mode)。
+// kind 字符串保持 'harness-mcp-server'(消息生产者身份, 与包名无关)。
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap { 'harness-mcp-server': { kind: 'harness-mcp-server' } & ContextFormed }
+}
+
 /** Cordis 插件名 */
 export const name = 'harness-mcp-server'
 
 /** 插件版本(与 package.json 同步; MCP initialize 时上报) */
-export const VERSION = "0.12.1"
+export const VERSION = "0.13.0"
 
 /**
  * 声明依赖的核心服务。
@@ -102,28 +110,27 @@ export const VERSION = "0.12.1"
  */
 export const inject = ['tools', 'llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'sessions']
 
-/** 插件配置 */
-export interface Config {
-  http?: boolean
-  port?: number
-  host?: string
-  /** 后端 provider(默认 deepseek-official) */
-  provider?: string
-  /** 执行任务的模型(默认 deepseek-v4-flash) */
-  model?: string
-  /** 挂载的 agent preset(默认 standard) */
-  preset?: string
-  /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
-  maxAgents?: number
-  /** 单次维护操作(如 session_compact)的超时毫秒数(默认 60 分钟; 0 = 不限制) */
-  taskTimeoutMs?: number
-  /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
-  authToken?: string
-  /** Bearer token 列表(任一命中即放行; 与 authToken 并存, 适合多客户端各自持一个 token) */
-  authTokens?: string[]
-  /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
-  workspaceRoots?: string[]
-}
+/**
+ * 插件配置 schema(dsh 0.2.0 形态): 命名空间 = profile 条目 id(`harness-mcp-server`)。
+ * 只有 `.volatile()` 字段会进自动生成的设置表单, 并可在设置页热改; 其余字段仍只从入口 config 读。
+ * 类型 `Config` 由 schema 推导(`Schemastery.TypeT`), 供 apply 签名等内部使用。
+ */
+export const Config = schemastery.object({
+  http: schemastery.boolean().default(true).description('是否启用 HTTP MCP 端点(默认 true)'),
+  port: schemastery.number().min(1).max(65535).default(8090).volatile().description('端口(1-65535, 默认 8090)'),
+  host: schemastery.string().min(1).default('127.0.0.1').volatile().description('监听地址(默认 127.0.0.1 仅本机; 0.0.0.0 暴露局域网, 建议同时启用 token)'),
+  provider: schemastery.string().default('deepseek-official').description('后端 provider(默认 deepseek-official)'),
+  model: schemastery.string().default('').description('执行任务的模型(留空跟随 dsh 默认)'),
+  preset: schemastery.string().default('standard').description('挂载的 agent preset(默认 standard)'),
+  maxAgents: schemastery.number().default(8).description('常驻 agent 会话上限(默认 8, LRU 淘汰)'),
+  taskTimeoutMs: schemastery.number().default(3600000).description('单次维护操作(如 session_compact)的超时毫秒数(默认 3600000; 0 = 不限制)'),
+  authToken: schemastery.string().default('').volatile().role('secret').description('Bearer token, 留空=无认证(仅本机时安全)'),
+  authTokens: schemastery.array(schemastery.string()).default([]).description('Bearer token 列表(任一命中即放行, 与 authToken 并存)'),
+  workspaceRoots: schemastery.array(schemastery.string()).default([]).description('cwd 白名单(设置后 agent 只能在列出的目录下干活)'),
+})
+
+/** 插件配置类型: 从上面的 schema 推导(volatile 字段为 `Volatile<T>`, 经 `.get()` 读取)。 */
+export type Config = Schemastery.TypeT<typeof Config>
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
 const runtimeConfig = {
@@ -158,42 +165,15 @@ function bearerTokenOk(header: string | undefined): boolean {
   })
 }
 
-// ── settings 命名空间: web 设置面板可配置的持久化子集(生效值 = schema 默认 → 入口 config base → 用户层) ──
-
-/** settings 命名空间名(web 设置卡片以它为键配对) */
-const SETTINGS_NAMESPACE = 'harness-mcp-server'
-
-/** 设置界面可编辑的持久化字段(入口 config 里 taskTimeoutMs 等其余字段不进 settings) */
-interface HarnessMcpSettings {
-  host: string
-  port: number
-  authToken: string
-}
-
-/** schemastery schema: 也是设置面板渲染与 wire 校验的依据 */
-const HarnessMcpSettingsSchema = schemastery.object({
-  host: schemastery.string().default('127.0.0.1'),
-  port: schemastery.number().default(8090),
-  authToken: schemastery.string().default(''),
-})
-
-/** ctx.settings 的结构化最小面(避免绑定宿主具体实现类型) */
-interface SettingsProviderLike {
-  register(
-    ns: string,
-    schema: unknown,
-    options?: {
-      base?: Partial<HarnessMcpSettings>
-      applies?: 'live' | 'restart'
-      validate?: (value: HarnessMcpSettings) => void
-    },
-  ): SettingsScopeLike
-}
-
-/** register 返回的命名空间 scope 的结构化最小面 */
-interface SettingsScopeLike {
-  get(): HarnessMcpSettings
-  watch(callback: (next: HarnessMcpSettings, prev: HarnessMcpSettings) => void | Promise<void>): () => void
+/**
+ * 读取一个配置字段: dsh 0.2.0 把 `.volatile()` 字段解析为 `Volatile<T>`(实现 `get()`)。
+ * 在 `ctx.effect` 里调用 `get()` 即订阅该字段的变更(保存设置后 effect 重跑);
+ * 仓库自带 harness 的桩 ctx 仍直接传普通值, 这里同时接受两种形态(行为与旧版一致)。
+ */
+function readField<T>(field: unknown, fallback: T): T {
+  const getter = (field as { get?: unknown } | null | undefined)?.get
+  if (typeof getter === 'function') return (getter as () => T).call(field)
+  return (field as T | undefined) ?? fallback
 }
 
 // ── 会话「模式」词汇: agent 预设 + 沙箱访问模式 + 审批策略 ──
@@ -395,10 +375,10 @@ async function getAgent(
         resumeSessionId: sid,
         agentOptions,
         setup: async (agentCtx) => {
-          // dsh 0.1.1-rc.2 起已修复 rc.6 的 agent ctx 丢 scope 问题(agent-loop 会 createScope);
+          // dsh 0.2.0-rc.1 起已修复 rc.6 的 agent ctx 丢 scope 问题(agent-loop 会 createScope);
           // 保留检测以兼容更旧版本: 无 scope 时跳过挂载(降级为无工具 agent), 不让 resume 整体崩溃。
           if (scopeOf(agentCtx) === undefined) {
-            console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.1.1-rc.2 for full tool support')
+            console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.2.0-rc.1 for full tool support')
             return
           }
           await ctx.agentPresets.mount(agentCtx, resumePreset)
@@ -466,17 +446,17 @@ async function createPoolAgent(ctx: Context, cwd: string, title?: string, agentO
   const presetId = modeOpts?.preset ?? runtimeConfig.preset
   const handle = await ctx.agents.create({
     sessionId: newSessionId,
-    // meta.agentPreset 自 dsh 0.1.1-rc.2 起是官方字段(session header 记录/预置选择器消费);
+    // meta.agentPreset 自 dsh 0.2.0-rc.1 起是官方字段(session header 记录/预置选择器消费);
     // 但 preset 仍需在 setup 里显式 mount —— agentPresets 不做自动挂载, 只对未挂载 agent 告警。
     meta: { cwd: canonical, agentPreset: presetId },
     agentOptions,
     setup: async (agentCtx) => {
       // 关键: 通过 setup 挂载 preset(含 bash/fs/todo/web 等完整工具)。
       // rc.6 的 agent-loop 曾把 setup 收到的 agent ctx 弄丢 scope tag(挂载会抛
-      // 'refusing to compose an unscoped context'); 0.1.1-rc.2 已修复。
+      // 'refusing to compose an unscoped context'); 0.2.0-rc.1 已修复。
       // 这里保留检测以兼容更旧版本: 无 scope 时跳过挂载(降级为无工具 agent), 避免 session_send 整体失败。
       if (scopeOf(agentCtx) === undefined) {
-        console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.1.1-rc.2 for full tool support')
+        console.warn('[harness-mcp-server] agent ctx unscoped (old dsh bug); preset mount skipped — upgrade dsh >= 0.2.0-rc.1 for full tool support')
         return
       }
       await ctx.agentPresets.mount(agentCtx, presetId)
@@ -736,7 +716,7 @@ function mcpTurnInFlight(sessionId: string, agent?: unknown): boolean {
   if ((mcpPendingTurns.get(sessionId) ?? 0) <= 0) return false
   const session = (agent as { session?: unknown } | undefined)?.session
   if (session === undefined) return true
-  if (foldTurnState((session as { log?: readonly unknown[] }).log ?? []).openTurn !== null) return true
+  if (foldTurnState(sessionEventsOf(session)).openTurn !== null) return true
   const inbox = (agent as { inbox?: { nextTurn?: readonly unknown[] } } | undefined)?.inbox
   return (inbox?.nextTurn?.length ?? 0) > 0
 }
@@ -799,7 +779,7 @@ const sessionModelOverrides = new Map<string, { provider?: string; model: string
 /** 应用到会话的 agent preset 登记(sessionId → preset id): 创建/接管时记录, 供结果/会话列表回读生效 preset */
 const sessionPresetApplied = new Map<string, string>()
 
-/** ctx.agentPresets 的只读视图(鸭子类型, 避免硬依赖 dsh-agent-presets 内部类型) */
+/** ctx.agentPresets 的只读视图(鸭子类型, 避免硬依赖 dsh-agent-preset-registry 内部类型) */
 interface AgentPresetsView {
   list?: () => Promise<Array<{ id: string; name?: string; description?: string; trust?: string; order?: number; path?: string; broken?: string }>>
   resolve?: (id: string) => Promise<{ id: string; name?: string; description?: string; trust?: string; order?: number; path?: string; broken?: string } | undefined>
@@ -811,18 +791,40 @@ interface PermissionPresetsView {
   resolve?: (name: string) => { sandbox?: string; approval?: string; name?: string; description?: string } | undefined
   defaultPreset?: string
 }
-/** ctx.sandboxPolicy / ctx.approval 的只读视图(鸭子类型; 服务可选) */
+/** ctx.sandboxPolicy / ctx.approval 的只读视图(鸭子类型; 服务可选)。
+ *  0.2 依据: dsh-sandbox-policy 与 dsh-user-approval 的服务都暴露公开的 overrideOf(session)
+ *  ——「会话日志里最后一条 sandbox/mode / approval/policy 事件, 无则 undefined」, 即折叠加读取的权威入口。 */
 interface SandboxPolicyView {
   defaultMode?: string
   workspaceRoot?: string
+  overrideOf?: (session: unknown) => string | undefined
 }
 interface ApprovalServiceView {
   config?: { policy?: string }
+  overrideOf?: (session: unknown) => string | undefined
 }
 
-/** 从会话事件流折出生效沙箱模式(最后一条 sandbox/mode 事件; 无覆盖回退部署默认) */
-function effectiveSandboxModeOf(session: unknown, fallback: string): string {
-  const events = (session as { events?: Array<{ type?: string; data?: { mode?: string } }> }).events ?? []
+/** 0.2 的 Session 没有 events 公开属性、log 是私有字段; 同步读访问器 snapshotEvents()
+ *  已标记废弃但今天可用(dsh-session lib/types/index.d.ts:193)—— 统一走它,
+ *  拿不到时退回旧形状(events/log), 保证对老宿主仍可读。 */
+function sessionEventsOf(session: unknown): readonly unknown[] {
+  const s = session as { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[]; log?: readonly unknown[] }
+  if (typeof s.snapshotEvents === 'function') {
+    try { return s.snapshotEvents() ?? [] } catch { /* 访问器抛错时落回旧形状 */ }
+  }
+  return s.events ?? s.log ?? []
+}
+
+/** 会话生效的沙箱模式, 三层回退:
+ *  ① ctx.sandboxPolicy.overrideOf(session)(0.2 服务的权威折叠加读取);
+ *  ② snapshotEvents() 扫最后一条 sandbox/mode 追加事件(最后一条生效);
+ *  ③ 部署默认(调用方传入)。 */
+function effectiveSandboxModeOf(ctx: Context, session: unknown, fallback: string): string {
+  try {
+    const override = (ctx.get('sandboxPolicy') as SandboxPolicyView | undefined)?.overrideOf?.(session)
+    if (typeof override === 'string' && override !== '') return override
+  } catch { /* 服务不可用/抛错: 落回事件折叠加 */ }
+  const events = sessionEventsOf(session) as ReadonlyArray<{ type?: string; data?: { mode?: string } }>
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]
     if (e?.type === 'sandbox/mode' && e.data?.mode) return e.data.mode
@@ -830,9 +832,16 @@ function effectiveSandboxModeOf(session: unknown, fallback: string): string {
   return fallback
 }
 
-/** 从会话事件流折出生效审批策略(最后一条 approval/policy 事件; 无覆盖回退部署默认) */
-function effectiveApprovalPolicyOf(session: unknown, fallback: string): string {
-  const events = (session as { events?: Array<{ type?: string; data?: { policy?: string } }> }).events ?? []
+/** 会话生效的审批策略, 三层回退:
+ *  ① ctx.approval.overrideOf(session)(0.2 服务的权威折叠加读取, 语义即「the session's effective policy fold」);
+ *  ② snapshotEvents() 扫最后一条 approval/policy 追加事件(最后一条生效);
+ *  ③ 部署默认(调用方传入)。 */
+function effectiveApprovalPolicyOf(ctx: Context, session: unknown, fallback: string): string {
+  try {
+    const override = (ctx.get('approval') as ApprovalServiceView | undefined)?.overrideOf?.(session)
+    if (typeof override === 'string' && override !== '') return override
+  } catch { /* 服务不可用/抛错: 落回事件折叠加 */ }
+  const events = sessionEventsOf(session) as ReadonlyArray<{ type?: string; data?: { policy?: string } }>
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]
     if (e?.type === 'approval/policy' && e.data?.policy) return e.data.policy
@@ -874,8 +883,8 @@ function sessionModeOf(ctx: Context, sessionId: string, session: unknown, header
   permissionPreset?: string
 } {
   const defaults = deploymentModeDefaults(ctx)
-  const sandbox = effectiveSandboxModeOf(session, defaults.sandbox)
-  const approval = effectiveApprovalPolicyOf(session, defaults.approval)
+  const sandbox = effectiveSandboxModeOf(ctx, session, defaults.sandbox)
+  const approval = effectiveApprovalPolicyOf(ctx, session, defaults.approval)
   const permissionPreset = permissionPresetNameOf(ctx, sandbox, approval)
   return {
     preset: effectivePresetOf(sessionId, header),
@@ -976,9 +985,11 @@ async function listPresetIds(ctx: Context): Promise<string[]> {
   }
 }
 
-/** 从审批请求的会话事件里取审计 id(倒查最近一条匹配 callId 的 approval/asked, 与 web GUI 应答者同款); 找不到时合成兜底 id */
+/** 从审批请求的会话事件里取审计 id(倒查最近一条匹配 callId 的 approval/asked, 与 web GUI 应答者同款); 找不到时合成兜底 id。
+ *  0.2 依据: approval/asked 的 data 是 { id, toolName, callId?, reason? }(dsh-user-approval lib/types/types.d.ts:37),
+ *  且 Session 没有公开 events 属性 —— 事件经 snapshotEvents() 读。 */
 function approvalPromptIdOf(req: { agent: { session: unknown }; toolName: string; callId?: string }): string {
-  const events = ((req.agent.session as unknown as { events?: Array<{ type?: string; data?: { id?: string; callId?: string } }> }).events ?? [])
+  const events = sessionEventsOf(req.agent.session) as ReadonlyArray<{ type?: string; data?: { id?: string; callId?: string } }>
   const decided = new Set<string>()
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]
@@ -995,7 +1006,7 @@ function approvalPromptIdOf(req: { agent: { session: unknown }; toolName: string
 /** 检测挂起的 ask_user_question 工具调用(本插件未接管该提问时, 这是感知它的唯一途径):
  *  倒查最后一条 ask_user_question 的 tool/call, 其后没有 tool/result 即为挂起。 */
 function detectPendingAskUser(session: unknown): { id: string; questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }> } | undefined {
-  const log = (session as { log?: unknown[] }).log ?? []
+  const log = sessionEventsOf(session) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
   let callIdx = -1
   for (let i = log.length - 1; i >= 0; i--) {
     const e = log[i] as { type?: string; data?: { name?: string } }
@@ -1047,7 +1058,7 @@ function agentIdOf(agent: unknown): string | undefined {
 /**
  * 构造一条 form:'notice' 的 plugin 来源 user/message(web UI 折叠提示行专属呈现, 与官方插件同款)。
  *
- * 呈现契约(已对照 DSH web 前端 0.1.1-rc.2 源码 + 实际运行 GUI 的 client 包确认):
+ * 呈现契约(已对照 DSH web 前端 0.2.0-rc.1 源码 + 实际运行 GUI 的 client 包确认):
  *  - dsh-agent-loop 把 additionalContexts 里的消息原样 append 为 user/message(source 含 form/summary),
  *    即 form:'notice' 在 additionalContexts 路径上**会被保留**——因此无需 exec.deferContext 等替代方案;
  *  - dsh-client-runtime 的 contextForm(source) 读 source.form, KNOWN_FORMS 含 'notice'
@@ -1061,8 +1072,7 @@ function noticeUserMessage(text: string, summary: string) {
   return createUserMessage({
     content: [{ type: 'text', text }],
     source: {
-      kind: 'plugin',
-      plugin: 'harness-mcp-server',
+      kind: 'harness-mcp-server',
       form: 'notice' as const,
       summary: boundContextSummary(summary),
     },
@@ -1102,7 +1112,7 @@ function flushPromptNotices(agent: unknown, downstream: { kind?: string; additio
  * next-step inbox, 让 web UI 在用户响应(prompt_respond)之前就能看到, 不再等响应后才随
  * tools/post-execute flush 落地。
  *
- * 落点选型(对照 DSH 0.1.1-rc.2 核心源码逐一实证; 两份候选方案均被否决, 理由如下):
+ * 落点选型(对照 DSH 0.2.0-rc.1 核心源码逐一实证; 两份候选方案均被否决, 理由如下):
  *  - 方案A-2(拦截期直接 session.append user/message)被否决 —— 拦截时机恒处于
  *    「assistant(tool_calls) 已落日志、其 tool/result 未回」窗口: dsh-agent-loop 的 startCall
  *    先 appendToolCall 再 prepare/dispatch, 而 approval/request 在工具执行内触发
@@ -1166,9 +1176,13 @@ interface TurnState {
   lastText: string
 }
 
-/** 取一条消息事件的文本块(非文本块/空文本返回 '', 从根上消除 session_read 的 '(no text blocks)' 噪声) */
-function assistantTextOf(event: unknown): string {
-  const content = (event as { data?: { message?: { content?: Array<{ type?: string; text?: string }> } } })?.data?.message?.content
+/** 取一条消息事件的文本块(非文本块/空文本返回 '', 从根上消除 session_read 的 '(no text blocks)' 噪声)。
+ *  0.2 依据: SessionEventMap['user/message'] 的 data 就是 UserMessage 本体(content 直接在 data 上,
+ *  dsh-session lib/types/types.d.ts:294); 'assistant/message' 的 data 才是 {turn, step, message}(:330)。
+ *  两种形状都兼容, 旧宿主 user/message 的 {message, source} 形状也仍可读。 */
+function messageTextOf(event: unknown): string {
+  const d = (event as { data?: { content?: Array<{ type?: string; text?: string }>; message?: { content?: Array<{ type?: string; text?: string }> } } })?.data
+  const content = Array.isArray(d?.content) ? d.content : d?.message?.content
   if (!Array.isArray(content)) return ''
   return content
     .filter((c) => c.type === 'text' && typeof c.text === 'string' && c.text !== '')
@@ -1205,7 +1219,7 @@ function foldTurnState(events: readonly unknown[]): TurnState {
       }
       state.lastTurnAssistantText = currentTurnText.join('\n')
     } else if (type === 'assistant/message') {
-      const text = assistantTextOf(e)
+      const text = messageTextOf(e)
       if (text) { currentTurnText.push(text); state.lastText = text }
     }
   }
@@ -1233,7 +1247,7 @@ function turnBoundaryOf(ctx: Context, session: unknown): TurnBoundaryView | unde
 
 /** live 会话的 turn 状态: 日志折叠为主, turnBoundaryProjection 校正(投影说在飞但窗口里看不到 start 时补齐) */
 function liveTurnState(ctx: Context, session: unknown): TurnState {
-  const state = foldTurnState((session as { log?: readonly unknown[] })?.log ?? [])
+  const state = foldTurnState(sessionEventsOf(session)) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
   const boundary = turnBoundaryOf(ctx, session)
   if (boundary !== undefined && boundary.openTurnStartSeq !== null && boundary.openTurnStartSeq !== undefined) {
     state.openTurn = state.openTurn ?? { turn: boundary.lastTurn ?? 0, startedSeq: boundary.openTurnStartSeq }
@@ -1258,11 +1272,20 @@ interface ColdHandle {
   close(): Promise<void>
 }
 
-/** ctx.sessionPersistence 的只读视图(鸭子类型) */
+/** ctx.sessionPersistence 的只读视图(鸭子类型)。
+ *  0.2 依据: list(): Promise<readonly SessionPersistenceSnapshot[]>, 行是
+ *  { header: SessionHeader; revision; eventCount?; sizeBytes? } —— id/cwd/agentPreset 都在 row.header 上
+ *  (dsh-session-persistence lib/types/index.d.ts:14-30)。 */
 interface PersistenceView {
   stat?: (id: unknown, options?: unknown) => Promise<{ eventCount?: number } | undefined>
   open?: (id: unknown, access: 'read', options?: unknown) => Promise<ColdHandle>
-  list?: (options?: unknown) => Promise<Array<{ id: unknown; cwd?: string; agentPreset?: string }>>
+  list?: (options?: unknown) => Promise<readonly unknown[]>
+}
+
+/** 0.2 的 list() 行 → header(id/cwd/agentPreset 在 row.header 上); 旧宿主 id 直接在行上, 兜底兼容 */
+function persistedRowHeaderOf(row: unknown): { id?: unknown; cwd?: string; agentPreset?: string } {
+  const r = row as { header?: { id?: unknown; cwd?: string; agentPreset?: string } }
+  return r.header ?? (row as { id?: unknown; cwd?: string; agentPreset?: string })
 }
 
 /** 冷读结果 */
@@ -1298,7 +1321,7 @@ function windowHasTurnBoundary(events: readonly unknown[]): boolean {
  *  ② 兜底: 直接解压 ~/.dsh/sessions/<项目键>/<sessionId>/session.vN.jsonl.zstd(zstd CLI)——
  *     官方读句柄不可用时仍能拿到事实(撕裂尾行由 JSON.parse 逐行容错跳过)。
  *
- * 注(实测 dsh 0.1.5-rc.2 + dsh-session-persistence-jsonl): stat() 不提供 eventCount, 拿不到总长时
+ * 注(实测 dsh 0.2.0-rc.1 + dsh-session-persistence-jsonl): stat() 不提供 eventCount, 拿不到总长时
  * 退化走 read(0) 全量读 + 尾部切片; 后端若提供 eventCount 则直接按窗口 seek(少读很多)。两者结果一致。
  */
 async function readColdLog(ctx: Context, sessionId: string, minEvents: number): Promise<ColdLog | undefined> {
@@ -1410,7 +1433,9 @@ async function readColdLogFromDisk(sessionId: string, maxEvents: number): Promis
 async function persistedHeaderOf(ctx: Context, sessionId: string): Promise<{ cwd?: string; agentPreset?: string } | undefined> {
   try {
     const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
-    for (const h of (await persistence?.list?.()) ?? []) {
+    for (const row of (await persistence?.list?.()) ?? []) {
+      // 0.2: list() 行是 { header, revision, ... }, id/cwd/agentPreset 在 row.header 上
+      const h = persistedRowHeaderOf(row)
       if (String(h.id) === sessionId) {
         return { ...(h.cwd !== undefined ? { cwd: h.cwd } : {}), ...(h.agentPreset !== undefined ? { agentPreset: h.agentPreset } : {}) }
       }
@@ -1530,7 +1555,7 @@ async function buildSessionStatus(ctx: Context, sessionId: string): Promise<Sess
   let note: string | undefined
 
   if (agent !== undefined && session !== undefined) {
-    const log = (session as { log?: readonly unknown[] }).log ?? []
+    const log = sessionEventsOf(session) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
     state = liveTurnState(ctx, session)
     prompts = promptsFor(sessionId, session)
     logEvents = log.length
@@ -1631,9 +1656,11 @@ async function findSessionHeader(ctx: Context, sessionId: SessionId): Promise<Se
   const sessions = ctx.get('sessions') as { get?: (id: SessionId) => { header: SessionHeader } | undefined } | undefined
   const live = sessions?.get?.(sessionId)
   if (live !== undefined) return live.header
-  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<SessionHeader[]> } | undefined
-  for (const header of (await persistence?.list?.()) ?? []) {
-    if (header.id === sessionId) return header
+  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<readonly unknown[]> } | undefined
+  for (const row of (await persistence?.list?.()) ?? []) {
+    // 0.2: list() 行是 { header, revision, ... }, id 在 row.header 上
+    const header = persistedRowHeaderOf(row)
+    if (header.id === sessionId) return header as SessionHeader
   }
   return undefined
 }
@@ -1653,8 +1680,10 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
   const headers = new Map<string, SessionHeader>()
   const sessions = ctx.get('sessions') as { list?: () => { header: SessionHeader }[] } | undefined
   for (const session of sessions?.list?.() ?? []) headers.set(session.header.id, session.header)
-  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<SessionHeader[]> } | undefined
-  for (const header of (await persistence?.list?.()) ?? []) {
+  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<readonly unknown[]> } | undefined
+  for (const row of (await persistence?.list?.()) ?? []) {
+    // 0.2: list() 行是 { header, revision, ... }, id/cwd 在 row.header 上
+    const header = persistedRowHeaderOf(row) as SessionHeader
     if (!headers.has(header.id)) headers.set(header.id, header)
   }
 
@@ -1685,8 +1714,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   })
 
   mcp.tool('harness_list_tools', '列出 Harness 当前注册的所有工具名', {}, async () => {
-    const tools = ctx.tools as unknown as { keys?: () => Iterable<string> } | null
-    const names = tools && typeof tools.keys === 'function' ? Array.from(tools.keys()) : []
+    // 0.2 依据: tools 服务没有 keys(), 只有 get/schemas/register/restrict/guard;
+    // schemas(scope?) 返回 ToolSchema[], name 在 schema 上(dsh-tools lib/types/index.d.ts, dsh-llm types.d.ts:462)
+    const tools = ctx.tools as unknown as { schemas?: () => Array<{ name?: string }> } | null
+    const names = (tools?.schemas?.() ?? []).map((s) => s.name ?? '').filter((n) => n !== '')
     return out(JSON.stringify(names))
   })
 
@@ -1936,7 +1967,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       }
       const agent = resolved.handle.agent
       try {
-        const log = ((agent.session as unknown as { log?: unknown[] }).log ?? [])
+        const log = sessionEventsOf(agent.session) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
         // limit 按「表面事件」计: 真实 dsh 日志里 assistant/chunk、reasoning-chunks、step/* 等流式/内部事件
         // 占绝对多数且稀疏夹杂表面事件, 直接 slice 原始日志会让 limit 失效(最后 N 条原始日志常只含 1 条表面事件)。
         // 因此先收集表面事件下标, 再取最近 N 条格式化。
@@ -1954,9 +1985,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           const e = ev as { seq?: number; type?: string; data?: { message?: { content?: { type?: string; text?: string }[] }; name?: string; arguments?: string } }
           const type = e.type
           if (type === 'user/message' || type === 'assistant/message') {
-            const content = e.data?.message?.content
-            const text = (content ?? []).filter((c) => c.type === 'text' && c.text).map((c) => c.text).join('\n').slice(0, 4000)
-            events.push({ seq: e.seq, type, text: text || '(no text blocks)' })
+            // 0.2: user/message 的 data 就是 UserMessage(content 在 data 上); assistant/message 才是 {message} —— 统一经 messageTextOf 兼容两种形状
+            const text = messageTextOf(ev)
+            events.push({ seq: e.seq, type, text: text.slice(0, 4000) || '(no text blocks)' })
           } else if (type === 'tool/call') {
             events.push({ seq: e.seq, type, text: `${e.data?.name ?? '?'}(${String(e.data?.arguments ?? '').slice(0, 2000)})` })
           } else if (type === 'tool/result') {
@@ -2042,7 +2073,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         try {
           agent.followup(createUserMessage({
             content: [{ type: 'text', text: composeTaskMessage(context ?? '', message) }],
-            source: { kind: 'plugin', plugin: 'harness-mcp-server' },
+            source: { kind: 'harness-mcp-server' },
           }))
         } catch (e) {
           unmarkMcpTurn(sid)
@@ -2097,7 +2128,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       let source: 'live' | 'persisted'
       let total: number
       if (agent !== undefined) {
-        events = (agent.session as unknown as { log?: readonly unknown[] }).log ?? []
+        events = sessionEventsOf(agent.session) // 0.2: log 是私有字段, 同步读走 snapshotEvents()
         source = 'live'
         total = events.length
       } else {
@@ -2125,7 +2156,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         if (sinceSeq !== undefined && typeof e.seq === 'number' && e.seq <= sinceSeq) continue
         let text = ''
         if (type === 'user/message' || type === 'assistant/message') {
-          text = assistantTextOf(e)
+          text = messageTextOf(e)
           if (text === '') continue // 空文本消息不返回(修 '(no text blocks)' 噪声)
         } else if (type === 'tool/call') {
           const d = e.data as { name?: string; arguments?: unknown; input?: unknown } | undefined
@@ -2291,8 +2322,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         })
       }
       // 持久化(未在上两层出现的会话; 日志未加载, 上下文未知; 仅 header 已知 preset)
-      const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<{ id: unknown; cwd?: string; agentPreset?: string }[]> } | undefined
-      for (const h of (await persistence?.list?.()) ?? []) {
+      const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<readonly unknown[]> } | undefined
+      for (const row of (await persistence?.list?.()) ?? []) {
+        // 0.2: list() 行是 { header, revision, ... }, id/cwd/agentPreset 在 row.header 上
+        const h = persistedRowHeaderOf(row)
         const id = String(h.id)
         if (!rows.has(id)) {
           const preset = h.agentPreset ?? runtimeConfig.preset
@@ -2509,7 +2542,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         return err(JSON.stringify({ error: 'agent inbox unavailable' }))
       }
       try {
-        const msg = createUserMessage({ content: [{ type: 'text', text: message }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } })
+        const msg = createUserMessage({ content: [{ type: 'text', text: message }], source: { kind: 'harness-mcp-server' } })
         inbox.append(target ?? 'next-turn', msg as never)
       } catch (e) {
         if (resolved.disposeAfter) { try { await resolved.handle.dispose() } catch { /* ignore */ } }
@@ -2567,20 +2600,19 @@ function registerTools(mcp: McpServer, ctx: Context): void {
 /**
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。
  */
-export async function apply(ctx: Context, config: Config = {}): Promise<void> {
-  // 初始化运行时配置(覆盖默认值)
+export async function apply(ctx: Context, config: Partial<Config> = {}): Promise<void> {
+  // 初始化运行时配置(覆盖默认值); host/port/authToken 三个 volatile 字段改为下面 effect 里读取
   if (config.provider) runtimeConfig.provider = config.provider
   if (config.model) runtimeConfig.model = config.model
   if (config.preset) runtimeConfig.preset = config.preset
   if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
   if (config.taskTimeoutMs !== undefined) runtimeConfig.taskTimeoutMs = config.taskTimeoutMs
-  if (config.authToken) runtimeConfig.authToken = config.authToken
   if (config.authTokens?.length) runtimeConfig.authTokens = [...config.authTokens]
   if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
 
-  // 生效监听配置: 入口 config 引导; 有 settings 服务时被用户层(设置界面)覆盖, 见下方注册段
-  let effectiveHost = config.host ?? '127.0.0.1'
-  let effectivePort = config.port ?? 8090
+  // 生效监听配置: 入口 config 引导; volatile 字段(host/port/authToken)随后被设置页订阅覆盖
+  let effectiveHost = readField(config.host, '127.0.0.1')
+  let effectivePort = readField(config.port, 8090)
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
   console.log('[harness-mcp-server] apply called, port=', effectivePort)
 
@@ -2645,10 +2677,10 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   // ── 提问应答者: 把挂起的 ask_user_question 交接给 MCP 调用方(用 prompt_respond 应答) ──
   // dsh-user-questions 有两代宿主形态, 用 API 探测兼容(两版宿主都要能跑):
   //   ① ≤0.1.1(旧版): UserQuestionService 有单槽 registerProvider(provider) —— 先到先得, 注册成功即全量接管;
-  //   ② ≥0.1.5(新版): registerProvider 被删除(2026-09 升级), 改为 Agent 作用域 waterfall 事件
+  //   ② ≥0.2.0-rc.1(新版): registerProvider 被删除(2026-09 升级), 改为 Agent 作用域 waterfall 事件
   //      'user-questions/request'。web GUI 客户端以 ctx.remote.$on 挂在同一事件上, waterfall 语义
   //      outermost-first、不调 next() 即 veto 后续 listener —— 故用 prepend 抢先认领(与 approval/request 同款)。
-  // ⚠️ 只试 ①(旧代码)正是本 bug 的根因: 0.1.5 上 registerProvider 为 undefined → 静默跳过注册 →
+  // ⚠️ 只试 ①(旧代码)正是本 bug 的根因: 0.2.0-rc.1 上 registerProvider 为 undefined → 静默跳过注册 →
   //    questionsProviderOurs=false → 提问全落到 GUI listener → prompt_respond 走「未挂起」拒绝分支。
   interface UserQuestionRequestView {
     questions: Array<{ id: string; question: string; detail?: string; options?: { label: string }[] }>
@@ -2658,7 +2690,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
   /** 提问交接实现(两版宿主共用): 生成 promptId → 挂 pendingQuestions → 等 prompt_respond / abort 落定。
    *  返回 AskUserQuestionAnswer = { answers: [{ id, selected, custom }] } ——
-   *  已对照 0.1.5 lib/types/types.d.ts 确认答案形态与 0.1.1 一致(selected 可为空数组, 自由文本走 custom)。 */
+   *  已对照 0.2.0-rc.1 lib/types/types.d.ts 确认答案形态与 0.1.1 一致(selected 可为空数组, 自由文本走 custom)。 */
   const answerQuestionViaMcp = (request: unknown): Promise<{ answers: Array<{ id: string; selected: string[]; custom?: string }> }> => {
     const r = request as UserQuestionRequestView
     const promptId = `q-${randomUUID()}`
@@ -2727,7 +2759,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       questionAnswererMode = 'none'
     }
   } else {
-    // ② 新版宿主(≥0.1.5): 注册到 waterfall, prepend 抢在 web GUI 的 remote listener 之前。
+    // ② 新版宿主(≥0.2.0-rc.1): 注册到 waterfall, prepend 抢在 web GUI 的 remote listener 之前。
     //    listener 签名 (request, next) —— 认领即返回答案(不调 next, veto 后续应答者);
     //    不认领(非 MCP 会话/非 MCP 任务期)必须 return next() 透传给 GUI。
     try {
@@ -2748,7 +2780,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (questionAnswererMode === 'legacy-provider') {
     console.log('[harness-mcp-server] user-questions answerer registered via legacy registerProvider() (dsh-user-questions ≤0.1.1); question prompts answerable via prompt_respond')
   } else if (questionAnswererMode === 'waterfall-listener') {
-    console.log("[harness-mcp-server] user-questions answerer registered on the 'user-questions/request' waterfall, prepend (dsh-user-questions ≥0.1.5); question prompts answerable via prompt_respond")
+    console.log("[harness-mcp-server] user-questions answerer registered on the 'user-questions/request' waterfall, prepend (dsh-user-questions ≥0.2.0-rc.1); question prompts answerable via prompt_respond")
   } else {
     console.warn('[harness-mcp-server] user-questions answerer not registered (legacy host, provider slot already taken); question prompts route to the web GUI answerer and remain visible via session_status/pending_prompts')
   }
@@ -2850,35 +2882,34 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (rebindNeeded) rebind(next.host, next.port)
   }
 
-  // ── settings 命名空间注册: web 设置面板「插件配置」卡片的宿主半区 ──
-  // 入口 config 作为组合层 base(用户层未覆盖时的值); 用户经设置界面写入的值落在用户层并即时生效。
-  // 无 settings 服务的部署(headless 等)回调不触发, 保持纯入口配置行为。
-  if (typeof ctx.inject === 'function') {
-    ;(ctx.inject as unknown as (names: string[], cb: (settingsCtx: { settings: SettingsProviderLike }) => void) => unknown)(
-      ['settings'],
-      (settingsCtx: { settings: SettingsProviderLike }) => {
-    const scope = settingsCtx.settings.register(
-      SETTINGS_NAMESPACE,
-      HarnessMcpSettingsSchema,
-      {
-        base: {
-          ...(config.host !== undefined ? { host: config.host } : {}),
-          ...(config.port !== undefined ? { port: config.port } : {}),
-          ...(config.authToken !== undefined ? { authToken: config.authToken } : {}),
-        },
-        applies: 'live',
-        validate: (v) => {
-          if (!v.host || v.host.trim() === '') throw new Error('host 不能为空')
-          if (!Number.isInteger(v.port) || v.port < 1 || v.port > 65535) throw new Error('port 必须是 1-65535 的整数')
-          if (/[\r\n]/.test(v.authToken)) throw new Error('authToken 不能包含换行')
-        },
-      },
-    )
-        applyEffective(scope.get())
-        scope.watch((next) => applyEffective(next))
-      },
-    )
+  // ── 生效配置: 三个 volatile 字段(host/port/authToken) ──
+  // 入口 config 已是 schema 解析结果(默认值已填)。读取用 readField: 真实宿主把 volatile 字段
+  // 解析为 `Volatile<T>`(实现 .get()); 仓库 harness 的桩 ctx 直接传普通值 —— 两者都接受。
+  // 首次应用与初始监听相同 ⇒ applyEffective 不重复 listen; 仅 host/port 变化才 rebind。
+  const syncEffective = (): void => {
+    applyEffective({
+      host: readField(config.host, '127.0.0.1'),
+      port: readField(config.port, 8090),
+      authToken: readField(config.authToken, ''),
+    })
   }
+
+  // 首次应用: 在 effect 里执行并登记生命周期。
+  ctx.effect(() => {
+    syncEffective()
+    // 该 effect 无可释放资源(server 生命周期由下方独立 effect 管理); 返回空 disposer 满足 cordis 契约。
+    return () => {}
+  }, 'harness-mcp-server: effective-config')
+
+  // 设置页保存 volatile 字段后即时生效: dsh 0.2.0 的 loader 对 volatile-only 配置更新
+  // **不重跑插件/effect**, 而是就地更新 volatile 引用后发出 'loader/volatile-update'
+  // (源码: @deepseek-ai/cordis-plugin-loader lib/config/entry.ts `_commitVolatile` ——
+  //  updateVolatile(ref, source) 之后 fiber.ctx.emit(self, 'loader/volatile-update', paths))。
+  // 因此必须显式监听该事件, 否则保存 host/port/token 不会生效。
+  ;(ctx.on as unknown as (name: string, listener: () => void) => unknown)(
+    'loader/volatile-update',
+    () => syncEffective(),
+  )
 
   // 存量捞回: 启动后异步补挂未分组会话, 不阻塞启动; 全程兜底 try/catch 防 unhandled rejection
   void (async () => {
